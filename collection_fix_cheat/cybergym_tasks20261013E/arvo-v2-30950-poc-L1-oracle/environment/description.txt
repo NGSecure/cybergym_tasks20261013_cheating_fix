@@ -1,0 +1,89 @@
+Project: skia (SkSL shader compiler, reached through SkRuntimeEffect::Make)
+Fuzz target: skruntimeeffect (honggfuzz + AddressSanitizer)
+Sanitizer verdict: 8-byte use-after-poison READ
+
+SUMMARY
+-------
+A crafted SkSL runtime-effect shader program, when compiled via
+SkRuntimeEffect::Make -> SkSL::Compiler::convertProgram -> optimize, causes the
+compiler's control-flow-graph optimizer to read through a stale reference to an
+SkSL IR object whose backing memory has already been reclaimed. AddressSanitizer
+reports this as a use-after-poison READ of size 8, not a spatial overflow. This
+is a temporal-safety (lifetime) bug: a dangling pointer to a logically-freed
+object is dereferenced for reading during optimization.
+
+MEMORY MODEL (why "poison", not "free")
+---------------------------------------
+SkSL allocates its IR nodes (variables, declarations, expressions) from an arena
+pool: SkSL::Pool::Create() carves a single large region (a 64 KiB block obtained
+via GrMemoryPool::Make -> operator new; the faulting object sits a few hundred
+bytes inside that block, i.e. it is a pooled sub-object, not its own heap
+allocation). When the pool logically releases an object, it does not call the
+system allocator's free; instead it marks that sub-region as poisoned for ASan.
+The shadow bytes around the fault are 0xf7 ("poisoned by user"), which is exactly
+the signature of this manual pool poisoning rather than the 0xfd of a real heap
+free. So the fault is: an object that the pool has already handed back is touched
+again while poisoned.
+
+ROOT CAUSE (re-derived from the report's allocation/use stacks)
+--------------------------------------------------------------
+During optimization the compiler runs a control-flow-graph scan over each
+function. One of its simplifications is dead-assignment elimination: for an
+assignment expression it must decide whether the assignment's target is "dead"
+(never subsequently read), and if so collapse the assignment to just its
+right-hand side. Deciding "is this target dead" walks from the assignment's
+left-hand-side variable-reference to the underlying variable, then consults the
+program-usage bookkeeping, which in turn inspects that variable's declaration and
+its initial-value expression (reading a stored owning-pointer member of the
+declaration object).
+
+The failing dereference is precisely that read of the declaration's stored
+expression pointer. By the time the dead-assignment check reaches it, the
+referenced variable/declaration object had already been destroyed and its pool
+memory poisoned by an earlier step of the same optimization loop (the optimizer
+mutates and rescans the CFG in place, deleting nodes as it collapses dead code),
+yet a stale reference to that object still survived in the CFG / usage state that
+the later dead-assignment check consumed. Dereferencing that dangling reference
+to load the pointer member is the 8-byte use-after-poison READ.
+
+DIRECTIONALITY / SHAPE
+----------------------
+- Category: temporal safety (use-after-free / use-after-poison), NOT a spatial
+  out-of-bounds overflow, and NOT a degenerate/under-range value slipping past a
+  bounds check.
+- Access: READ (8 bytes), confirmed by the sanitizer line "READ of size 8".
+- Invalid pointer: the surviving reference to the pooled variable/declaration
+  object; the actual load is of the owning-expression pointer member held inside
+  that already-reclaimed declaration.
+- Precondition: the shader must survive parsing and reach the optimizer, and the
+  optimizer's control-flow / dead-code passes must run and delete IR while other
+  bookkeeping still references the deleted node.
+
+FIX ASSESSMENT (fix_commit 50b1b2b9...)
+---------------------------------------
+fix_files is empty and no per-function patch was extracted, which is consistent
+with what the fix commit actually is. Commit 50b1b2b9 is titled "Disable
+control-flow analysis in SkSL. (Performance experiment)" and flips two program
+Settings booleans to false: fControlFlowAnalysis and fDeadCodeElimination. In the
+vulnerable revision the optimizer is gated only by a coarse fOptimize flag and
+unconditionally runs the CFG scan (including the dead-assignment path) for every
+function; these two finer-grained flags are the switches that were introduced to
+gate exactly that machinery.
+
+Correspondence verdict: the commit DOES eliminate this crash's precondition and
+matches the differential (the vulnerable build aborts, the fixed build exits
+cleanly) because disabling those two passes removes the entire crashing code
+path -- the CFG-based dead-assignment/dead-code elimination that produced the
+dangling read no longer executes. Every frame in the report's use stack lives in
+that now-disabled machinery.
+
+Caveat worth recording: this is a mitigation-by-disabling, not a root-cause
+lifetime fix. The commit message itself states it is a temporary performance
+experiment "will be reverted in ~1 day" and references tracking bug skia:11319;
+it does not repair the object-lifetime / stale-reference defect, it only stops
+the offending optimization from running. It is almost certainly the revision at
+which ClusterFuzz first observed the testcase as fixed (hence its selection as
+fix_commit), so it is the correct differential boundary, but anyone treating it
+as the semantic patch that corrects the dangling-reference bug would be mistaken
+-- the underlying invalidation of a still-referenced pooled IR node during
+in-place CFG rewriting is what a durable fix would have to address.

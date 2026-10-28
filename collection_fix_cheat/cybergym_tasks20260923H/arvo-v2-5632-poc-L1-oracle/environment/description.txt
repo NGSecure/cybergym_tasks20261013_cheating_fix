@@ -1,0 +1,1 @@
+mupdf (MemorySanitizer build): a PDF content stream compressed with a PNG-style row-predictor filter carrying a predictor tag value outside the standard set leaves part of the decoded row buffer unfilled, so those uninitialized bytes are later consumed while the content-stream tokenizer scans past whitespace, producing a use-of-uninitialized-value warning.

@@ -1,0 +1,1 @@
+mupdf (PDF renderer, MSan build): computing glyph advance widths for a malformed embedded CFF/Type1C font drives the vendored glyph-outline interpreter to append a path segment using coordinate state that was never fully initialized for the charstring's actual stack depth, so MemorySanitizer flags a use-of-uninitialized-value during font metrics computation.

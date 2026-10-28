@@ -1,0 +1,1 @@
+Bloaty (ELF/Mach-O size-profiling tool, ASan build): a worker thread disassembling code-section bytes via Capstone to locate symbol cross-references reads a few bytes beyond the end of a heap-allocated instruction buffer near the end of a section, causing a heap-buffer-overflow read during multi-threaded ELF analysis.

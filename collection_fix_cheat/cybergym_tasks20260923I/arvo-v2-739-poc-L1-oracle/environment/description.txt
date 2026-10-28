@@ -1,0 +1,1 @@
+A bug in FreeType2 (ASan 8-byte heap-buffer-overflow write) overruns an internal buffer while normalizing a variable font's design coordinates because a malformed font makes the expected number of named instances inconsistent with the size of the buffer written during normalization.

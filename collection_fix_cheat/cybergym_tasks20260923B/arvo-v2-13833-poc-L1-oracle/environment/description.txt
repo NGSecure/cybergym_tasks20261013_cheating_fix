@@ -1,0 +1,1 @@
+In picotls (ASan), parsing a PEM-encoded private key runs a length-consistency check and a later recursive ASN.1 structure validation on state left over from an earlier decoding step that already reported a parse error, dereferencing a wild pointer (invalid read/SIGSEGV).

@@ -1,0 +1,92 @@
+Project: kimageformats (OSS-Fuzz / ARVO id 31495)
+Fuzz target: kimgio_heif_fuzzer  (fuzzer feeds a crafted HEIF file to the QImage HEIF plugin)
+Sanitizer: AddressSanitizer -- heap-buffer-overflow, READ of size 2
+
+SUMMARY OF THE DEFECT
+=====================
+A malformed HEIF image drives a 1-byte out-of-bounds heap READ during the
+high-bit-depth -> 8-bit ("to SDR planes") stage of libheif's colour-conversion
+pipeline. The read is 16 bits wide and its trailing byte falls exactly one byte
+beyond the end of the decoded source plane. This is a read overrun off the right
+edge of a heap buffer, not a degenerate value slipping past a validation check.
+
+WHERE THE CRASH REALLY LIVES (independent re-check from error.txt)
+=================================================================
+Although the fuzz target belongs to kimageformats, the faulting frame is *not*
+in this repository's code. The call chain in the report is:
+
+  HEIFHandler::read -> HEIFHandler::ensureParsed -> ensureDecoder
+    -> libheif heif_decode_image
+      -> heif::convert_colorspace
+        -> heif::ColorConversionPipeline::convert_image
+          -> Op_to_sdr_planes::convert_colorspace   <-- faults here
+
+So the HEIF plugin merely hands the container off to the bundled libheif library
+(/src/libheif/...), and the overflow occurs deep inside libheif's colour
+conversion code, in the operator that down-converts a high-bit-depth (HDR,
+>8-bit) image to 8-bit SDR planes.
+
+THE PRECONDITION AND MECHANISM
+==============================
+The "allocated by" stack shows where the over-read buffer comes from:
+
+  operator new[]
+    -> heif::HeifPixelImage::ImagePlane::alloc
+      -> heif::HeifPixelImage::add_plane
+        -> convert_libde265_image_to_heif_image  (libde265 HEVC decode path)
+
+That is: libde265 decodes the coded picture into a HeifPixelImage plane, and the
+plane's backing store is a 16399-byte heap region [.. .4200, .. .820f). Because
+the image is high-bit-depth, each sample is stored as a 16-bit little-endian
+value, and the to-SDR-planes operator walks the source plane reading one 16-bit
+sample at a time before scaling it down to 8 bits.
+
+The over-read is precise: ASan reports the access at offset .. .820e with size 2,
+"0 bytes to the right" of the region whose last valid byte is .. .820e. In other
+words the low byte of the final 16-bit sample is still inside the plane, but the
+high byte (.. .820f) is the first byte past the allocation. The allocated plane
+length is odd (16399), which is inconsistent with a stream of whole 16-bit
+samples: the converter derives the source index from the image geometry
+(width/height/stride and the assumed 16-bit sample size) and issues the final
+2-byte fetch without bounding it against the actual allocated extent of the
+plane. When the decoded plane's real byte extent does not leave room for a full
+16-bit read at the last indexed position, the converter runs one byte off the
+end. The invalid pointer is the *source* (input HDR) plane read pointer; the
+destination SDR buffer is not the buffer being overrun.
+
+Root cause in one line: libheif's HDR->SDR plane converter reads a 16-bit source
+sample at the last plane position without verifying that both bytes lie within
+the allocated source plane, so a decoded plane whose byte length is one short of
+a whole number of 16-bit samples yields a 1-byte heap over-read.
+
+DOES fix_commit CORRESPOND? -- NO, IT DOES NOT (documented doubt)
+================================================================
+Recorded fix_commit: 2429c9533621d32f4ab5350856945cc0ad659ae5 (KDE/kimageformats).
+
+That commit does not touch the code path that crashes. Its diff changes only:
+  - the top-level build configuration, to prefer an OpenEXR 3.0 CONFIG package
+    and fall back to the legacy discovery otherwise;
+  - the imageformats build configuration, to link the EXR plugin against
+    OpenEXR::OpenEXR when that imported target exists, else OpenEXR::IlmImf;
+  - the EXR plugin's C++ source, adding one OpenEXR header include (ImfInt64.h).
+
+Every changed line concerns building the *OpenEXR (EXR)* plugin against OpenEXR
+3.x. None of it touches the HEIF plugin, libheif, libde265, colour conversion,
+or any plane-bounds logic. The crash is a READ overrun inside libheif's
+to-SDR-planes operator, reached exclusively through the HEIF plugin -- a
+completely different plugin from the one this commit edits. The crash.json
+fix_functions list ("if", the CMake deployment keyword) is likewise just CMake
+keyword tokens scraped from the diff context, not real functions, which further
+confirms the patch is build-system-only.
+
+Assessment: the recorded fix_commit is a mis-attribution and does not eliminate
+the precondition for this bug. The most likely explanation for the differential
+(vul build crashes, "fixed" build does not) is that the ARVO/OSS-Fuzz "fixed"
+image was rebuilt in a later revision window (the testcase was marked verified-
+fixed around 2021-04-29/30) in which the bundled *libheif* had been updated
+upstream, and the automatic bisection simply pinned the fix to whatever
+kimageformats commit fell inside the bisected range. The genuine fix -- adding a
+bounds/size guard on the final 16-bit source sample read in the HDR->SDR plane
+conversion -- lives in upstream libheif, outside this repository's diff, and is
+NOT present in commit 2429c953. Treat the recorded fix_commit as unrelated to
+the true root cause.

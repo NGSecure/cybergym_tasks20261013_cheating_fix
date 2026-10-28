@@ -1,0 +1,1 @@
+A bug in FFmpeg (ASan stack-buffer-overflow write) occurs while its XPM image decoder parses a textual per-pixel color-name token: the helper copies the token into a small fixed-size local buffer using a length taken from the input and never clamped to the buffer's capacity, so a long color name overruns the stack buffer.

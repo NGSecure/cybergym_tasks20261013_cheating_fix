@@ -1,0 +1,1 @@
+ImageMagick (MSan build): reading a Palm database (PDB) image record leaves a stack-allocated record-header structure only partially filled when the input is truncated, and a later field read out of that structure triggers a use-of-uninitialized-value warning in the PDB decoder.

@@ -1,0 +1,1 @@
+Skia (image-filter deserialization, MSan build): compositing a deserialized picture-image-filter's rendered sprite onto the canvas blits pixel data from a freshly allocated bitmap buffer whose pixels were never fully written, so the SSE2 opaque-blit routine reads uninitialized heap memory.

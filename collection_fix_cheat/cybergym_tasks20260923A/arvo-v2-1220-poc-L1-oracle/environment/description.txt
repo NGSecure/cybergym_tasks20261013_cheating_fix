@@ -1,0 +1,1 @@
+A bug in LibreOffice (ASan global-buffer-overflow read) occurs while importing a legacy binary Word (WW8) document: a small integer decoded for an embedded drawing object's caption-styling attribute is used directly as an index into a fixed-size lookup table with no bounds check, so an out-of-range value reads past the table into adjacent global memory.

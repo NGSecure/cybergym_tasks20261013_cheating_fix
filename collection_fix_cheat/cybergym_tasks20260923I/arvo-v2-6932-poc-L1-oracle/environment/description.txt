@@ -1,0 +1,60 @@
+ImageMagick can render MVG (Magick Vector Graphics) documents, a small
+text-based drawing language: a script of primitives (paths, polylines,
+rectangles, ellipses, etc.) plus stroke/fill attributes, one of which lets
+the caller ask for a *dashed* outline via a dash pattern and a dash offset.
+When a shape is stroked with a non-trivial dash pattern, the renderer does
+not simply draw the original path — it walks along the path's vertices and
+synthesizes a brand-new, denser sequence of short "dash" and "gap"
+sub-segments that approximate the dashed look, then strokes each dash
+segment individually.
+
+To hold that synthesized sequence, the dash-rendering routine allocates a
+scratch array up front, sized using a simple formula derived from the
+number of vertices in the *original* (un-dashed) path — roughly "twice the
+vertex count plus a small constant". The assumption baked into that formula
+is that no more than about two synthesized dash/gap boundary points will
+ever be needed per original path segment. In the steady-state part of the
+algorithm (the branch that starts a new dash segment) there is an explicit
+bounds check comparing the current write index against that same
+"twice-the-vertex-count" estimate before it writes, so it stays inside
+the buffer.
+
+But that estimate turns out to be too tight, and not every place that
+advances the write index and stores an entry is protected by that check.
+In particular, when the outer loop finishes processing one polygon edge —
+after the inner "keep peeling dash/gap sub-segments off this edge" loop has
+run out of length on that edge — the code unconditionally records one more
+"boundary point" entry at the current write index to close out that edge,
+increments the index, and moves on to the next vertex. This trailing write
+happens regardless of how close the write index already is to the
+allocated capacity, because it is reached via a different code path than
+the one that carries the capacity guard. For a crafted path/dash-pattern
+combination that is just large enough in vertex count and just awkward
+enough in how the dash pattern interacts with each edge's length, repeated
+edge-closing writes can walk the index one slot past the end of the
+allocated scratch array before the algorithm terminates, corrupting the
+heap immediately after it.
+
+The upstream fix does not change the loop's guard logic at all. It simply
+increases the padding constant in the original allocation-size formula by
+one element, giving the worst-case number of trailing "close out this
+edge" writes enough headroom in the buffer that the unguarded write can
+never step outside the allocation, regardless of how the vertex
+count/dash-pattern combination lines up.
+
+To reproduce: craft an MVG input that strokes a multi-vertex path (a
+polyline, or an open/closed shape built from several line segments) with a
+dash pattern set via the dash-array/dash-offset drawing attributes, chosen
+so that the number of path vertices and the dash pattern's segment lengths
+interact to push the synthesized dash-boundary count just past what the
+scratch buffer was sized for. Feed that MVG document through image
+decoding (e.g. as the input format directly) so it reaches the drawing
+primitive interpreter and the dashed-stroke rendering path.
+
+fix_commit plausibility: highly plausible: the parent commit's line
+containing the flagged allocation call is byte-identical to the crash
+trace's allocation-site line, the commit's message references the exact
+upstream OSS-Fuzz issue number for this crash, and the one-line diff
+(enlarging the allocation's padding constant by one element) directly
+closes the unguarded trailing write identified above without touching any
+unrelated code.

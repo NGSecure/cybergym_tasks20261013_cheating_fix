@@ -1,0 +1,1 @@
+open62541 (OPC UA server stack, ASan build): during server shutdown, a secure channel's deferred worker-queue cleanup callback still walks a session entry that the session-tracking subsystem had already released earlier in the same shutdown sequence, causing a heap-use-after-free read.

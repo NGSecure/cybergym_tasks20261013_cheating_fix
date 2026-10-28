@@ -1,0 +1,1 @@
+A bug in GDAL's NTF (Ordnance Survey) vector driver makes AddressSanitizer report a 1-byte heap overflow read because a trailing-whitespace trimming loop over a short header record steps backward past the start of the record's small buffer when the record is shorter than the driver assumes.

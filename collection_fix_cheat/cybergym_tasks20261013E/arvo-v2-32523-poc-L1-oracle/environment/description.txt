@@ -1,0 +1,22 @@
+A wild-pointer read crash occurs inside libc's free() while the container-configuration
+parser is processing a directive that removes a previously-configured network-interface
+entry by its numeric index. The by-index removal routine walks the linked list of
+already-configured network devices comparing each entry's index to the requested one, and
+keeps a single local "candidate device" pointer that is reassigned on every iteration --
+including iterations whose index does not match. If the loop finishes without ever finding
+the requested index, that pointer is left holding whatever device entry was visited last,
+which is still linked into (and owned by) the network-device list. A scope-exit cleanup
+attribute attached to that local pointer then unconditionally tears down and frees whatever
+struct it currently references once the function returns, with no check for whether a
+matching entry was actually found and unlinked first. The net effect is that an unmatched
+removal request silently frees a live, still-listed network device instead of doing
+nothing, leaving a dangling node inside the list. When a later configuration line walks or
+removes network devices again, it dereferences that dangling list entry as if it were still
+valid; because the freed memory has since been reused for something else, the fields read
+out of it are unrelated leftover bytes rather than a real struct. Root cause: one of those
+fields is subsequently passed straight to free() as a supposed string pointer, and since it
+is actually reused/garbage heap content rather than a valid allocation or NULL, free()
+dereferences an unmapped, essentially arbitrary address and the process crashes with a wild
+pointer read -- not a clean use-after-free or double-free diagnostic, but a raw invalid
+memory access surfacing several call frames below the original bug (the unconditional
+free-on-no-match in the removal routine).

@@ -1,0 +1,49 @@
+libjpeg-turbo's TurboJPEG image-loading API (`tjLoadImage`) can load a raw
+PPM/PGM file into an output pixel buffer whose color format is *specified by
+the caller*, independently of whatever the file itself contains. This report
+was found by the `compress_fuzzer` target, which drives the loader with an
+arbitrary byte buffer via `LLVMFuzzerTestOneInput` -> `tjLoadImage`.
+
+Crash: AddressSanitizer heap-buffer-overflow, a 1-byte WRITE landing exactly
+at the end of a small heap allocation (backed by the library's own
+`malloc`-based large-object allocator, i.e. a row buffer sized for the
+image's pixel data). The write happens deep inside the netpbm (PPM/PGM)
+source-image reader, in the routine that unpacks a "word" (16-bit-per-sample,
+i.e. maxval > 255) binary RGB triplet into the destination row buffer, one
+pixel at a time.
+
+Suspected mechanism: the reader's setup code picks which per-row conversion
+routine to install based only on the on-disk file type (binary PPM vs PGM)
+and whether samples are 8-bit or 16-bit — it does not check that this
+choice is actually compatible with the *destination* pixel format the caller
+asked for. The row-conversion routine invoked for 16-bit binary PPM input
+then unpacks each pixel by writing a fixed run of output samples (one write
+per RGB channel) and stepping the output pointer forward by that same fixed
+amount, as if every destination pixel always occupies exactly that many
+bytes. If the caller requested an output buffer whose pixel format actually
+uses fewer bytes per pixel than that fixed run (for example, a single-byte
+grayscale destination), the allocation sized for that narrower format is too
+small for the wider, fixed-width writes the conversion routine performs.
+Each pixel's write therefore encroaches slightly past where it should stop,
+and by the time the routine finishes converting the row, the cumulative
+overrun walks one byte past the end of the underlying heap allocation,
+corrupting the ASan red zone that immediately follows it.
+
+In short: a 16-bit-per-sample binary PPM (RGB) input file, loaded through
+`tjLoadImage` into an output buffer whose pixel format was never validated
+against that specific file/sample-width combination, drives the "word RGB"
+row-unpacking path to write past the end of a too-small destination buffer.
+
+fix_commit_plausible: yes. The fix touches the exact source file the crash
+frame is reported in, and specifically both (a) the same "word RGB" row
+-unpacking routine named directly in the crash backtrace, rewriting it to
+derive each channel's output offset and the per-pixel stride from the
+caller's actual requested color space/pixel layout instead of assuming a
+fixed 3-byte run, and (b) the setup routine (also present in the fix's
+function list and sitting directly above the crashing frame in the
+allocation backtrace) that chooses which row-conversion routine to install
+for 16-bit binary PPM/PGM input, which now rejects (errors out on) caller
+color-space/pixel-format combinations it previously accepted silently. That
+is precisely the caller-format-vs-file-format mismatch this crash exploits,
+so the commit is a strong, directly relevant match rather than an
+incidental/unrelated change.

@@ -1,0 +1,120 @@
+Summary
+=======
+A heap-buffer-overflow WRITE is triggered in FFmpeg while decoding a crafted
+AMV/Motion-JPEG stream that embeds a JPEG-LS (lossless) scan. AddressSanitizer
+reports a WRITE of 5924 bytes landing 0 bytes to the right of a 4576-byte heap
+region, i.e. the store runs off the end of an allocation that is exactly
+sizeof(MJpegDecodeContext) large. The faulting store is the zero-initialization
+memset at the top of the JPEG-LS picture-decoding routine, reached through the
+shared MJPEG start-of-scan handler on the AMV receive-frame path.
+
+Reproduced call chain (from error.txt)
+--------------------------------------
+  __asan_memset
+    -> JPEG-LS picture decode routine   (the memset that clears the JLS state)
+      -> ff_mjpeg_decode_sos            (start-of-scan dispatch)
+        -> ff_mjpeg_receive_frame
+          -> decode_receive_frame_internal / avcodec_send_packet
+            -> fuzzer target (AV_CODEC_ID_AMV)
+
+The overwritten buffer is not a decode surface: the "allocated by" stack shows
+it comes from avcodec_alloc_context3 -> init_context_defaults, which allocates
+the codec instance's private-data block (avctx->priv_data) whose size is the
+codec's declared priv_data_size. So the object being overrun is the decoder's
+private context, and the overrun starts exactly at its end.
+
+Root cause
+==========
+The JPEG-LS decoder was written as a "subclass" of the MJPEG decoder. Its
+private context was a struct that embedded an MJpegDecodeContext as its first
+member and appended a JLSState immediately afterward:
+
+    struct { MJpegDecodeContext mjpeg; JLSState state; }
+
+Consequently the JPEG-LS picture-decoding routine obtained its working state by
+casting the incoming MJpegDecodeContext* back up to that larger struct type and
+taking the address of the trailing sub-object:
+
+    JLSState *const state = &((<JLS-subclass>*)s)->state;   // offset == sizeof(MJpegDecodeContext)
+
+That address arithmetic is only valid when the private-data block was actually
+allocated with room for the trailing JLSState — that is, only for the standalone
+JPEG-LS decoder, whose priv_data_size was sizeof(the subclass struct).
+
+The precondition that is violated: the JPEG-LS picture decoder is not reached
+only through the JPEG-LS decoder. The MJPEG start-of-scan handler is shared by
+every MJPEG-family decoder, and it routes into the JPEG-LS path whenever the
+scan describes lossless/JPEG-LS content — regardless of which codec is actually
+running. The AMV decoder (like the plain MJPEG and THP decoders) declares
+priv_data_size = sizeof(MJpegDecodeContext) and has no trailing JLSState. When a
+crafted AMV packet carries a JPEG-LS scan, the shared handler calls into the
+JPEG-LS picture decoder with an MJpegDecodeContext that is only 4576 bytes long.
+The upcast then produces a JLSState* pointing at offset sizeof(MJpegDecodeContext)
+== 4576, i.e. right at (0 bytes past) the end of the private-data allocation, and
+the subsequent memset(state, 0, sizeof(*state)) clears sizeof(JLSState) == 5924
+bytes starting there — a linear out-of-bounds write over whatever heap follows
+the codec context.
+
+Direction / mechanism check
+---------------------------
+- This is an out-of-bounds WRITE, not a read: the memset stores zeros past the
+  allocation. It is a forward (to-the-right) overflow of a heap object, driven by
+  a type/size mismatch, not by a degenerate or wrapped length value — the write
+  length (sizeof(JLSState)) is fixed and correct for a real JLS context; what is
+  wrong is the base pointer, which is placed just past the end of a too-small
+  allocation because the private-data object is a bare MJpegDecodeContext rather
+  than the JPEG-LS subclass.
+- The invalidated pointer is the derived JLSState* (the up-cast of the codec's
+  private-data pointer s), not the picture/plane pointers, which are unrelated to
+  this bug.
+- No input pointer is NULL; ASan sees a valid-but-undersized allocation being
+  overrun by a fixed amount. A crafted, mislabeled scan type is the only
+  requirement.
+
+What the real fix removes
+=========================
+The fix stops treating the JPEG-LS state as a struct member that lives inline
+after the MJPEG context. It:
+  1. deletes the JPEG-LS "subclass" struct entirely;
+  2. adds a plain "struct JLSState *jls_state" pointer field inside
+     MJpegDecodeContext itself (forward-declared in the shared header), so the
+     state is reachable from any MJPEG-family context;
+  3. rewrites the JPEG-LS picture decoder to read state = s->jls_state and, when
+     that pointer is still NULL, allocate a JLSState of its own with av_malloc and
+     store it back into s->jls_state (returning ENOMEM on failure) — the state now
+     lives in its own separately sized heap buffer instead of being assumed to sit
+     just past the context;
+  4. changes the standalone JPEG-LS decoder's priv_data_size from the old subclass
+     size to sizeof(MJpegDecodeContext), since the subclass no longer exists;
+  5. frees s->jls_state (av_freep) in the shared MJPEG decoder close callback so
+     the newly heap-allocated state does not leak.
+
+After the fix, the out-of-bounds base pointer can no longer arise: the JLSState
+is a distinct allocation whose address is stored inside the context, so it is
+correctly sized no matter which MJPEG-family codec (AMV, MJPEG, THP, or the JPEG-LS
+decoder proper) drives the JPEG-LS scan path. The precondition the crash depended
+on — that the codec's private-data block always has sizeof(JLSState) spare bytes
+after the MJPEG context — is eliminated.
+
+Fix-commit assessment
+=====================
+crash.json records fix_commit = 718e03e5f297564b828730dfc012fa3f6fbf576b, and
+patch.diff is exactly that commit. Judgment: it corresponds to the root cause.
+Evidence:
+  - The diff touches precisely the three files/areas that form the causal chain:
+    the JPEG-LS decoder (removes the subclass struct, switches the state to a
+    lazily av_malloc'd s->jls_state, and drops priv_data_size to
+    sizeof(MJpegDecodeContext)); the shared MJPEG context header (adds the
+    forward-declared JLSState* member); and the shared MJPEG close callback (frees
+    s->jls_state).
+  - It directly rewrites the faulting statement's source of `state`: the
+    exact up-cast expression that produced the just-past-the-end pointer in the
+    ASan trace is replaced with a pointer read from a real, separately sized
+    allocation.
+  - This removes the necessary condition for the overflow (a fixed-size memset at
+    an offset equal to sizeof(MJpegDecodeContext)) rather than merely masking a
+    symptom, and it fixes it for the whole MJPEG family, matching the fact that
+    the crash was reached via the AMV decoder rather than the JPEG-LS decoder.
+The larger fix_commit_all list (16 commits) is just the ARVO vul->fix build
+range; the single designated fix_commit above is the one that addresses this
+issue, and fix_crash_overlap = 1 is consistent with that.

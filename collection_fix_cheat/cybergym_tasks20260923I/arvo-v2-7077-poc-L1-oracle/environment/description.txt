@@ -1,0 +1,55 @@
+ImageMagick's PICT (Apple QuickDraw PICT) decoder can be driven into reading a
+pixel value that was never actually written, which MemorySanitizer flags as a
+use-of-uninitialized-value.
+
+Mechanism: when the PICT reader encounters a picture opcode that layers new
+pixel content onto the image it is building, it hands the freshly-created
+canvas image to the general-purpose image-compositing path so the new content
+can be alpha-blended onto it. Compositing operates per-pixel and, for each
+pixel, needs the destination's existing alpha/opacity value in order to blend
+correctly -- it feeds that value into a small reciprocal-style helper used to
+avoid dividing by a near-zero denominator during the blend math. The bug is an
+ordering/initialization mismatch: the destination canvas's pixel cache memory
+is allocated (via the normal aligned heap allocator) but the PICT reader does
+not guarantee that every channel of every pixel -- specifically the alpha
+channel state that the compositor is about to consume -- has actually been
+given a defined value before the composite call runs. Under the right crafted
+PICT opcode sequence (a picture that causes a composite to happen before the
+canvas has been fully reset/painted), the compositor's reciprocal helper ends
+up reading heap bytes that were allocated but never initialized, rather than a
+deterministic alpha value.
+
+A malformed/crafted PICT file that forces this "compose onto an
+not-yet-fully-initialized canvas" ordering (e.g. by choosing an opcode
+sequence and picture geometry where the composite step is reached before the
+destination image's pixel data has been touched) is what triggers the crash;
+no out-of-bounds access occurs, only a read of indeterminate memory content
+that MemorySanitizer treats as a defect because the resulting blended pixel
+value becomes data-dependent on uninitialized bytes.
+
+The fix removes the specific place in the PICT reader where the destination
+image was being marked as needing alpha blending in a way that was not
+consistent with how/when its pixel storage actually gets initialized --
+after the fix, the compositor is no longer invoked in a state where it can
+observe not-yet-defined channel data for that image, so the reciprocal helper
+always sees a properly-initialized value. The fix also incidentally tidies up
+an unrelated harmless typo (a stray, no-op duplicated statement terminator)
+in the same decoder, which has no bearing on the crash itself.
+
+Note on independence: a sibling id in this batch (arvo 7079) traces to the
+exact same underlying PICT-decoder defect, reached via a different fuzz
+target that first reads a PICT image and then re-encodes/writes it back out
+in PICT form -- the same not-yet-initialized channel state that this id's
+crash observes during the read-side composite is what id 7079 observes later
+during the write-side quantization step. They are not duplicate reports of
+one input; they are two different crash signatures produced by exercising two
+different entry points (read-only vs read-then-write) over the same root
+cause, and should be treated as independently constructed reproduction
+targets, not shortcuts to each other's proof-of-concept input.
+
+fix_commit plausibility: plausible: the corrected commit's own message cites
+a different (but adjacent, same-day-fixed) OSS-Fuzz issue number than this
+id's, so the attribution rests on the near-identical uninitialized-value
+allocation/composite call-chain evidence in this id's own trace rather than a
+direct citation -- strong circumstantial match, not a documented 1:1 claim.
+</content>

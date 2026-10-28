@@ -1,0 +1,57 @@
+This is a heap-use-after-free (read) inside GDAL's virtual-file-system layer, reached while
+opening a crafted VRT (Virtual Raster) dataset description.
+
+Trigger: a VRT XML document that defines one or more raster bands of the "raw raster" flavor,
+each of which links to an underlying on-disk source file via GDAL's virtual file abstraction.
+GDAL's file-opening primitives support a "shared" mode: opening the same path/access-mode more
+than once does not create independent OS-level file objects — it hands back the *same* internal
+handle object to every caller, keeping a reference count so the object is only actually destroyed
+once the last caller releases it. A VRT document that causes this raw-raster linking routine to
+run more than once against the same underlying source path (e.g. two bands pointing at the same
+raw file, or the same band re-processed) will have every one of those calls receive the identical
+shared handle instance.
+
+Root cause: after obtaining a handle through this shared/reference-counted open, the raw-raster
+linking routine validates the requested layout — e.g. it computes how much memory the requested
+raster dimensions/pixel-and-line offsets imply and rejects the link if that is unreasonable, and
+separately validates other declared parameters such as byte order. When one of these validation
+checks fails for a given band, the error-handling path tears the handle down using the *plain,
+non-reference-counted* close primitive rather than the *shared* close primitive. The plain close
+unconditionally frees the underlying handle object regardless of how many other outstanding
+references the shared-open cache still has recorded for it. If another band (or another stage of
+processing the same band) obtained that identical shared handle earlier and is still holding a
+live pointer to it — because its own setup succeeded and it never got a chance to release its
+reference — that object has now been deleted out from under it. The next time that surviving
+reference is dereferenced (for instance, a subsequent bounds/offset sanity check that repositions
+the file cursor before reading), it touches already-freed heap memory: a classic shared-ownership
+lifetime mismatch, where one owner's failure path destroys an object a sibling owner still expects
+to be alive. A second, related error branch in the same routine simply forgets to release the
+handle at all on failure (a leak rather than a UAF, but symptomatic of the same "closing semantics
+were not respected consistently on every exit path" pattern).
+
+Fix direction: on the failing validation path, replace the unconditional/plain close with the
+shared-aware release call, so the reference count is decremented instead of the object being
+unconditionally destroyed — the underlying handle is only actually freed once its last reference
+goes away, and a sibling band that is still using the same shared handle keeps a valid object. The
+second error branch (the one that previously leaked instead of using the wrong close) is also
+given a matching release call, so every exit path out of the linking routine now disposes of the
+handle through the reference-counted API rather than mixing "shared open" with "unshared close" on
+some paths and "no close at all" on others.
+
+To reproduce: craft a VRT XML document with a raw-raster band setup that shares its source file
+path with another successfully-initialized part of the dataset, and arrange for that band's own
+raw-link setup to fail one of the internal validation checks (an oversized/inconsistent raster
+layout that would require an implausible amount of memory is one way to fail the check; an invalid
+declared byte-order string is another distinct failure branch worth trying). Feeding such a
+document through the VRT-driver open path under a heap-corruption-detecting sanitizer build should
+reproduce the use-after-free read.
+
+fix_commit plausibility: highly plausible: the "freed by" stack in the crash trace terminates
+inside the raw-raster link-setup routine's plain-close error branch, the "previously allocated by"
+stack shows the handle came from that same routine's shared-open call on the same source path, and
+the crashing read is a later seek operation reached through this routine's own memory-usage
+validation helper — i.e. the fix (in the raw-raster driver, changing the error-path close call to
+the reference-counted one) is a caller-side lifetime fix for a caller that mismatched shared-open
+with unshared-close, which is exactly the mechanism the trace shows; the low-level seek routine
+where the crash surfaces has no bug of its own, it is simply dereferencing the handle its caller
+mismanaged.

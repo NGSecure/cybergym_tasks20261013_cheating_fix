@@ -1,0 +1,50 @@
+This crash is reached through GDAL's vector-translate (ogr2ogr-style) pipeline, driven by a
+fuzzer harness that feeds it a small synthetic "archive" bundling a translate command line
+together with one or more tiny tabular vector datasets (e.g. CSV-with-WKT feature tables) to use
+as the source. The translate operation is configured (through the command-line arguments embedded
+in that archive) to write its output using the ESRI Shapefile driver, and the output target/layer
+name that ends up being handed down to the Shapefile driver's low-level file-creation routine
+resolves to an empty string -- i.e. a zero-length base name, as opposed to a normal path like
+"foo" or "dir/foo.shp".
+
+The Shapefile driver's create routine needs to derive a "base name" for the new .shp/.shx pair by
+taking whatever name it was given, stripping any directory separators, and stripping off a
+trailing filename extension if one is present, so it can then append the right suffix. To do this
+it allocates a small working buffer sized relative to the length of the incoming name, copies the
+name into it, and then walks backward through that buffer character by character looking for the
+last '.', '/', or '\' -- stopping the walk as soon as it hits the very front of the buffer. Once
+the backward walk stops, a separate step immediately after the loop looks at whatever character
+the walk index is currently pointing at, to decide whether an extension separator was found there,
+and if so trims the string at that point.
+
+The bug is that the loop's "keep going" condition only protects the *repeated* steps of the walk;
+it does not account for the degenerate case where the input name has zero characters to begin
+with. When the name is empty, the very first computed walk position already lies one slot before
+the start of the buffer -- the loop condition correctly refuses to iterate in that state, but
+because the extension-separator check happens as an unconditional step performed *after* the loop
+exits rather than only from *inside* an iteration that has confirmed the position is a real
+character in the string, the code goes ahead and reads whatever character sits at that
+already-invalid position anyway. For a zero-length base name, the working buffer for that name is
+allocated with only the minimal fixed slack (no room for the name itself), so the byte the
+out-of-bounds read lands on falls just outside that small heap allocation, which ASan reports as a
+1-byte heap-buffer-overflow read.
+
+The fix removes this pattern everywhere it was duplicated (the Shapefile open/create paths and the
+matching DBF open/create paths all shared the same hand-rolled "strip directory and extension"
+logic, which is why the fix touches all of those entry points, not just the one that crashed).
+In place of the old two-step "scan, then separately re-check the character where the scan
+stopped" logic, the replacement folds the extension-separator test into the scan loop itself, so
+the character at the current walk position is only ever inspected from within an iteration that
+the loop guard has already confirmed is a valid, in-bounds position; if the scan never finds a
+separator (including the empty-name case, where the scan performs zero iterations), it falls back
+to using the full, unmodified length of the input name rather than trusting a leftover index value
+computed by a loop that may not have actually run. This closes the gap because the index used to
+locate an extension is now provably always either an in-bounds position that was checked during a
+completed iteration, or never dereferenced at all.
+
+fix_commit plausibility: highly plausible: the pre-fix source (extracted from src-vul.tar.gz) shows
+the exact "scan backward, then dereference the stopping index right after the loop with no
+zero-length guard" pattern immediately below the allocation that the crash's own allocation stack
+frame points to, and the post-fix source (from src-fix.tar.gz) replaces it with the described
+loop-internal-check-plus-fallback-length helper, applied uniformly across every open/create entry
+point named in fix_functions.

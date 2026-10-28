@@ -1,0 +1,1 @@
+A heap-buffer-overflow read in Little CMS (lcms, ASan): a crafted ICC profile's color lookup table carries a channel count that is never validated against the table's reconstructed structure, so the float interpolation pass indexes the CLUT with an inconsistent channel count and reads past its end.

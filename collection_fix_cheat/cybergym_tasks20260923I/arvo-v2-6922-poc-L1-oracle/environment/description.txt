@@ -1,0 +1,52 @@
+This crash is reached through GDAL's GRIB2 output path: calling the GRIB driver's
+CreateCopy / gdal_translate to write a raster using the "complex packing" data-encoding
+mode of the bundled GRIB2 g2clib encoder library (a C port of an older Fortran encoder).
+Complex packing groups the raster's per-pixel values into runs, computes a per-group
+"extra length" value relative to a reference length, and then figures out the minimum
+number of bits needed to represent the largest such per-group extra-length value across
+all groups, before packing that information into the output message.
+
+The vulnerability is triggered by supplying (or synthesizing, via gdal_translate
+creation options) source raster data whose values are numerically close enough together
+— an extremely small dynamic range — that the packing routine's grouping logic ends up
+needing zero groups' worth of "extra length" adjustment: every group's length already
+matches the computed minimum/reference, so there is nothing to encode beyond it. The
+loop that determines how many bits are required for these per-group values starts its
+bit-width counter at zero and only increments it when it actually encounters a
+per-group value that doesn't fit in the current bit width; if the loop never finds such
+a value (because there is effectively nothing left needing adjustment, or every value is
+already representable in zero bits), the bit-width counter is left at its initial value
+of zero instead of the minimum-one that the rest of the code implicitly assumes.
+
+That bit-width counter is then handed to a companion routine whose job is to decide
+whether the total encoded size can be shrunk further by regrouping. This routine uses
+the counter, unmodified and unchecked, as a direct index (after subtracting one, since
+legitimate callers are assumed to pass at least one) into a fixed-size, 31-entry
+per-bit-width bookkeeping array that tallies the total encoded bit-count for each
+possible bit-width choice. When the counter is zero, "index minus one" becomes
+negative, so the write lands just before the start of that array in memory rather than
+inside it — an out-of-bounds write of a freshly computed 32-bit total-bits value. The
+array itself is an ordinary function-local array, not a source-level global; the
+sanitizer nonetheless reports the corruption as a "global-buffer-overflow" against it,
+which reflects how this particular fuzzing build's instrumentation classified that
+storage rather than any deliberate global/static declaration in the source.
+
+In short: the missing check is a lower-bound validation on the bit-width parameter
+before it is used to compute an array index. The routine implicitly assumes the value
+is always at least one — the ordinary case where at least one group needs its length
+adjustment recorded — but never verifies that assumption for the degenerate case where
+no group needs any adjustment at all.
+
+The fix closes this by adding an explicit guard near the top of the affected routine
+that checks the bit-width parameter falls within a sane range and rejects it with an
+error code, instead of proceeding to compute an index from it, before any of the
+per-bit-width bookkeeping happens — so a zero (or otherwise out-of-range) value now
+short-circuits into an error return rather than reaching the unchecked index
+computation. That range check is the entirety of the fix to this routine — it is what
+directly closes the reachable out-of-bounds write.
+
+fix_commit plausibility: highly plausible: the added range check is applied to exactly
+the parameter that is used to compute the array index at the reported crash site, and
+the crash address — a few bytes before the start of the well-known-size bookkeeping
+array — is consistent with that parameter having been at or near zero, i.e. the
+off-by-one/negative-index write that the new check now rejects outright.

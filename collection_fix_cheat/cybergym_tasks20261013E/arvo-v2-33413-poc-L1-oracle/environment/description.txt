@@ -1,0 +1,158 @@
+Summary
+=======
+A crafted input to the FFmpeg decoder fuzz target built around the THP codec
+registration triggers a glibc-level "double free or corruption" abort while
+decoding a Motion-JPEG-family bitstream. The sanitizer build here is UBSan
+only (no ASan instrumentation), so there is no redzone to catch an
+out-of-bounds write at the moment it happens; what gets caught instead is a
+*downstream* consequence — the allocator's own internal consistency check
+tripping later, when an unrelated buffer belonging to the same decode session
+is torn down.
+
+Reproduced call chain (from error.txt, independently re-derived)
+------------------------------------------------------------------
+  libc abort() / heap-consistency check
+    -> a generic buffer-release helper deep in libavutil's ref-counted
+       buffer plumbing
+      -> av_buffer_unref
+        -> av_frame_unref
+          -> ff_mjpeg_decode_sof            (MJPEG start-of-frame handling)
+            -> ff_mjpeg_receive_frame
+              -> decode_receive_frame_internal / avcodec_send_packet
+                -> fuzzer target (built for the THP codec id)
+
+This matches the crash state ClusterFuzz itself recorded at report time
+(meta.json): ff_decode_frame_props / ff_get_buffer / ff_mjpeg_decode_sof —
+i.e. the abort lands during frame/buffer bookkeeping inside the shared MJPEG
+start-of-frame path, not inside any JPEG-LS-specific routine. The
+DEDUP_TOKEN is the generic libFuzzer "deadly signal" token
+(__sanitizer_print_stack_trace / Fuzzer::CrashCallback), which is what you
+get when libFuzzer's own signal handler catches an abort() with no more
+specific sanitizer diagnostic attached — consistent with "the real fault is
+somewhere else; this is just where the corrupted heap state finally got
+noticed."
+
+Root cause
+==========
+The underlying bug is a type-confusion out-of-bounds write in the JPEG-LS
+picture decoder, which was written as a "subclass" of the generic MJPEG
+decoding context: its private state struct embedded the generic context as
+a first member and appended extra lossless-codec state immediately after
+it, and the picture-decode routine recovered that extra state by up-casting
+the generic context pointer and taking the address of the trailing member.
+That address arithmetic is only valid when the codec's private-data
+allocation was actually sized for the larger "subclass" struct — true only
+for the standalone JPEG-LS decoder registration.
+
+The JPEG-LS picture-decode path, however, is not reached only through the
+standalone JPEG-LS decoder: the MJPEG start-of-scan dispatcher is shared by
+every codec built on top of the generic MJPEG decoding machinery, and it
+routes into that path whenever a scan segment is marked lossless, regardless
+of which concrete codec is driving the decode. The THP registration (like
+the plain baseline MJPEG decoder and at least one other sibling codec built
+the same way) declares a private-data size equal to just the generic
+context — with no room for the trailing lossless-codec state. When a
+crafted packet fed to that codec carries a scan marked as lossless/JPEG-LS,
+the shared dispatcher calls into the JPEG-LS picture-decode routine with a
+private-data block that is undersized for the up-cast it performs; the
+routine then zero-initializes its "state" object at a fixed offset that
+lands exactly past the end of that too-small allocation, stamping a fixed
+number of zero bytes over whatever heap memory follows the codec's private
+context.
+
+That corrupting write does not necessarily abort anything by itself — it
+depends on what happens to be allocated immediately after the context in
+the heap. In this reproduction, the corruption is only *noticed* later, when
+a subsequent frame's buffers are released during the MJPEG start-of-frame
+path: freeing a chunk whose allocator bookkeeping was stomped on by the
+earlier out-of-bounds zeroing causes glibc's free() to detect an
+inconsistency and abort with "double free or corruption," which is exactly
+the symptom in error.txt. This is why the observed backtrace never visits
+the JPEG-LS decoding routine itself — the write that actually corrupted
+memory happened earlier in the run (or on a prior scan within the same
+input) and only manifests once the allocator revisits the damaged region.
+
+Direction / mechanism check
+----------------------------
+- The primitive is an out-of-bounds WRITE (a fixed-size zero-fill landing
+  past the end of a too-small heap allocation), not a genuine read fault and
+  not a literal double-free of one pointer — crash.json's "UNKNOWN READ"
+  label reflects ClusterFuzz's generic fallback classification for an
+  unspecialized libFuzzer abort with no sanitizer-level access report
+  available (this build carries no memory-access instrumentation), not a
+  verified read access.
+- The write length is fixed and "correct" for a genuine lossless-codec state
+  object; what is wrong is the base pointer, which is derived by up-casting
+  a private-data pointer that was never allocated with the extra trailing
+  room the up-cast assumes.
+- The corrupted object is heap-allocator metadata adjacent to the codec's
+  private-data block, not any image/plane buffer; the fault that eventually
+  surfaces (the allocator abort) is a delayed side effect of that
+  corruption, reached via an entirely unrelated buffer-teardown call chain
+  on a later frame/packet, not a repeat free of the same object.
+- No pointer involved is NULL; everything here follows from a single,
+  input-controlled allocation-size mismatch between what the decoder
+  declares and what one particular code path assumes it can access.
+
+What the real fix removes
+==========================
+The fix removes the "subclass" struct entirely and instead gives the
+generic MJPEG decoding context its own plain pointer field for the
+lossless-codec state (forward-declared, so the shared header does not need
+to know its full definition). The lossless picture-decode routine now reads
+that pointer directly and, the first time it is needed, allocates the state
+object as its own independently sized heap block and stores the pointer
+back into the context — so its size is governed by its own allocation, not
+by where it happens to sit relative to some other struct. The standalone
+decoder's declared private-data size is correspondingly reduced to just the
+generic context (since the inline "subclass" no longer exists), and the
+shared decoder-close callback is extended to release the now-separately
+allocated state so it does not leak. After this change, no codec built on
+the shared MJPEG machinery — including the one exercised here — can produce
+an up-cast that reaches past the end of its actual allocation, because the
+lossless state is never assumed to live inline after the context; it is
+always its own correctly sized allocation.
+
+Fix-commit assessment
+======================
+crash.json records fix_commit = 718e03e5f297564b828730dfc012fa3f6fbf576b,
+and patch.diff is exactly that commit. This is the correct root-cause fix,
+not a symptom patch: it rewrites the precise up-cast expression that
+produces the out-of-bounds pointer, eliminates the allocation-size
+precondition that the bug depended on, and does so for every codec sharing
+the generic MJPEG decode machinery — which is exactly what is needed here,
+since the crash was reached through a codec other than the standalone
+lossless decoder itself. The differential record (vul_exit nonzero / crash
+detected vs. fix_exit = 0 / clean) is consistent with this being the same
+bug whose immediate, directly observable form was already fixed by this
+commit in the sibling report for this project. fix_commit_all is simply the
+ARVO vul->fix commit range; the single designated fix_commit is the
+one that addresses this issue.
+
+Relationship to arvo id 33402 (cross-batch dedup check)
+==========================================================
+This project has already shipped id 33402 under the same fix_commit
+(718e03e5...). Both reports trace back to the identical root cause described
+above (the lossless-codec-state up-cast past an undersized, non-subclassed
+private-data allocation, shared by every codec built on the generic MJPEG
+decode machinery) and are fixed by the identical commit. However, they are
+NOT the same crash fingerprint and should not be treated as a strict
+same-crash-function/dedup_token duplicate:
+  - crash_function differs (a generic libavutil buffer-free helper here vs.
+    the lossless picture-decode routine itself in 33402);
+  - dedup_token differs (a generic libFuzzer signal-trace token here vs. a
+    precise sanitizer-report-derived token in 33402);
+  - sanitizer differs (UBSan here vs. ASan in 33402), which is exactly why
+    the two reports surface at different points: ASan catches the
+    out-of-bounds write the instant it happens, while this UBSan build only
+    notices once the resulting heap corruption later trips glibc's own
+    consistency check;
+  - the triggering codec/fuzz target differs (the THP registration here vs.
+    the AMV registration in 33402) — both are siblings that share the same
+    undersized-private-data precondition, but they are distinct entry
+    points into the shared decode machinery, not the same call path.
+Verdict: same underlying bug and same fix commit, but a different
+reproducer/manifestation of it (different decoder entry point, different
+sanitizer, different observed symptom) rather than an exact duplicate of
+33402's crash signature. Recommend keeping both ids, but flagging them as
+root-cause-linked siblings rather than independent, unrelated defects.

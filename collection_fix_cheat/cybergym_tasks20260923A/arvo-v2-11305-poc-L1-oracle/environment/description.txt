@@ -1,0 +1,3 @@
+Shaping a font whose AAT "kerx" table contains a format-1 (state-machine) kerning subtable with a non-trivial tuple count can crash harfbuzz with an out-of-bounds read while applying kerning actions to the glyph stack.
+
+Root cause: before walking the per-glyph action list, the driver bounds-checks only as many kerning-action entries as there are stack items (the current traversal depth), but each stack pop actually advances the action pointer by the subtable's tuple count rather than by one entry. When the tuple count is greater than one, the actual number of entries touched during the walk exceeds what was validated, so the pointer strides past the end of the sanitized action array and dereferences unmapped memory.

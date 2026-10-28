@@ -1,0 +1,1 @@
+irssi (ASan build): a theme file whose abstract-format definition references another abstract format triggers a self-referencing (recursive) pass through the client's format-macro expander, over-reading a dynamically resized formatting buffer by one byte.

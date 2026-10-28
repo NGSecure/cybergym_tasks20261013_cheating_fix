@@ -1,0 +1,77 @@
+Summary
+=======
+wasm3 (a WebAssembly interpreter) contains an out-of-bounds write on the
+interpreter value stack while evaluating a WebAssembly constant/init
+expression. The overflow corrupts adjacent heap state (the loaded module's
+function-table bookkeeping); a later lookup of an exported function then
+dereferences a wild pointer and faults with an invalid read. UBSan reports it
+as "SEGV / UNKNOWN READ", but the primary defect is an out-of-bounds WRITE.
+
+Affected path
+=============
+Every constant/init expression in a module (global initializers,
+element-segment offsets, data-segment offsets) is evaluated by the helper
+EvaluateExpression. That helper spins up a throw-away compilation plus a
+temporary runtime whose value stack is *borrowed from the real runtime*. In
+this reproduction the real runtime is created with a very small value stack
+(the harness calls m3_NewRuntime with a 128-byte stack, i.e. only a handful
+of 64-bit slots), so the value stack is tiny and easy to overrun.
+
+Root cause
+==========
+The compiler records the high-water mark of value-stack slots it allocates so
+that a bound check can later reject any expression that needs more slots than
+the runtime stack can hold. In the vulnerable build that high-water mark is
+updated ONLY while a real function object is being compiled — the update is
+guarded by an "if (compilation->function) { ... }" test. A constant/init
+expression, however, is compiled with no function object attached
+(compilation->function == NULL), so on this path the high-water mark is never
+recorded and, critically, EvaluateExpression performs NO stack-overflow check
+at all before it executes the freshly compiled expression.
+
+As a result, a crafted global initializer consisting of a long run of
+constant / numeric operators is compiled into code that addresses value-stack
+slots far beyond the small allocated buffer. EvaluateExpression then calls
+into that compiled code, and execution writes those slots: an out-of-bounds
+WRITE past the end of the runtime value-stack allocation, which smashes
+whatever heap memory follows it — including the just-parsed module's
+bookkeeping, i.e. its function count and the base pointer of its
+per-module function array.
+
+Observed crash
+==============
+Loading the module returns success (the overflow does not by itself abort the
+load). The harness then looks up an exported function by name via
+m3_FindFunction, which walks every module and, for each module, scans its
+function array reading each entry's import fields. Because the corruption set
+the module's function count to a non-zero value and clobbered the
+function-array base pointer with garbage (a small negative value, ~ -61 /
+0xff..c3), the per-module scan dereferences a wild function pointer while
+reading its import field, producing a READ from an unmapped near-null address
+(0xff..cb). That is the SEGV / UNKNOWN READ the sanitizer prints.
+
+Directionality (for reviewers)
+==============================
+- The underlying flaw is an out-of-bounds WRITE (value-stack index grows past
+  the allocated slot count — an overflow / over-large index, not a degenerate
+  value sneaking past an existing check). The missing ingredient is a bound
+  check that was simply never armed on the constant-expression path.
+- The crash that is *observed and reported* is a READ, but only as a
+  downstream consequence: the write corrupts the module's function-array base
+  pointer, and the later name lookup reads through that wild pointer.
+- The pointer that fails is the module's function-array base (an M3Function*),
+  not the value-stack pointer itself.
+
+Precondition removed by the fix
+===============================
+The corrected code makes the value-stack high-water mark be tracked
+unconditionally on the compilation object (it drops the "only while compiling
+a function" guard), and EvaluateExpression, immediately after compiling the
+expression, compares that high-water mark against the runtime's slot count. If
+the expression would need at least as many slots as the runtime provides, the
+helper fails with a stack-overflow trap and refuses to execute it. This
+removes the precondition — an unchecked, oversized value stack being run —
+so neither the out-of-bounds write nor the resulting wild-pointer read can
+occur. Constant expressions that fit within the stack continue to evaluate
+normally, which is why the fixed build no longer crashes on this input while
+still accepting valid modules.

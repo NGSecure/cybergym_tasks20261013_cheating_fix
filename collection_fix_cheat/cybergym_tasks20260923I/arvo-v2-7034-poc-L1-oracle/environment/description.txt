@@ -1,0 +1,42 @@
+This crash is reached by feeding ImageMagick's MVG (Magick Vector Graphics)
+reader a small, hand-crafted vector script — a text format describing
+drawing primitives such as paths and viewboxes. The script sets a stroke
+with a dash pattern (a "dash array") applied to a path/polyline primitive.
+The specific combination of vertex count in the path and the dash-array
+values is what triggers the bug; ordinary dashed strokes render fine.
+
+Mechanism: when the drawing engine renders a dashed stroke, it does not
+draw the original path directly. Instead it walks the path and produces an
+expanded sequence of short "dash" sub-segments, since a dashed line is
+really many disconnected strokes. As it walks, every time the running dash
+length crosses a vertex or a dash on/off boundary it emits one more entry
+into a working list of dash vertices; a couple of extra bookkeeping
+entries are also appended at the end to close/terminate that expanded
+sequence. Before doing any of this, the routine first counts how many
+vertices are in the *original* (undashed) primitive, and from that count
+computes and allocates a single fixed-size scratch buffer sized as a
+constant multiple of the original vertex count plus a small fixed constant
+of "extra" slots, on the assumption that this always covers the worst case
+of extra entries the dashing expansion can generate. That assumption is
+too tight: for some vertex-count / dash-array combinations, the expansion
+can legitimately produce a couple more entries than the fixed slack term
+allows for. Because the buffer is sized once up front from the *input*
+vertex count rather than from however many entries the expansion actually
+ends up writing, and the copy that populates each new entry is not
+bounds-checked against the true output length, the last one or two writes
+into that scratch buffer land past its end — corrupting adjacent heap
+memory (a heap-buffer-overflow write).
+
+Fix: the allocation formula's constant slack term is widened by a couple
+of additional slots, so the reserved buffer has enough headroom to hold
+every extra bookkeeping/boundary entry the dash-expansion logic can
+legitimately emit, closing the gap between the true worst-case output size
+and what was actually reserved for it.
+
+fix_commit plausibility: highly plausible: the associated fix touches
+exactly the allocation-size expression inside the same dashed-stroke
+expansion routine identified by the crash trace, and it increases (rather
+than restructures) the fixed slack term added on top of the vertex-count
+multiple — a direct, minimal-diff correction to an under-sized allocation
+that plausibly closes an overflow occurring during writes into that same
+buffer later in the routine.

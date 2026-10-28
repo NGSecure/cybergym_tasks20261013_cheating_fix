@@ -1,0 +1,1 @@
+A bug in gRPC's HTTP/2 HPACK decoder makes AddressSanitizer report an 8-byte global-buffer-overflow read while handling a literal header that references an existing header name by its table index and is then folded into the connection's dynamic header table, reachable with a single minimal header block.

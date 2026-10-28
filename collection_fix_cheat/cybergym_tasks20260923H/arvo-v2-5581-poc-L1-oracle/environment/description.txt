@@ -1,0 +1,1 @@
+ImageMagick (MSan build): parsing an XML character-entity reference embedded in an EPS/PostScript file's XMP metadata block reads from a heap buffer before all of its bytes have been written, triggering a use-of-uninitialized-value warning in the embedded XML tree parser.

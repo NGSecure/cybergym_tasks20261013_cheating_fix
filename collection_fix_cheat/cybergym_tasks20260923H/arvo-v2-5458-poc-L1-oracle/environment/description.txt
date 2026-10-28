@@ -1,0 +1,1 @@
+ImageMagick (ASan build): while resolving an XML/XMP entity declaration embedded in a crafted PostScript (PS) document's metadata, scanning the entity's replacement text reads one byte past the end of a small heap-allocated string buffer, producing a 1-byte heap-buffer-overflow read.
