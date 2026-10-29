@@ -10,7 +10,11 @@
         不带地址时提示输入；也可以一次给多个地址
 其他参数：
     --vcs    同时删掉 /src 下的 .git/.hg（Dockerfile 修复里的第二步；里面的 fix 提交记录也会泄露答案）
-    --keep   结束后不删本地镜像
+    --keep   结束后不删本地镜像和构建缓存
+
+本地磁盘：每处理完一个镜像（成功、失败、dry-run 都一样）就删掉本次拉下来的镜像、打的 tag，以及这次构建在
+构建缓存里留下的记录（原镜像各层也在里面，不删的话磁盘不会释放），然后打印磁盘剩余。机器上别人的镜像、
+运行前本地就有的镜像、别人的构建缓存都不动；只留下每次几 KB 的构建上下文记录（分不清是谁的，不删）。
 
 怎么删：用 "FROM <原镜像>" + "RUN rm -f /tmp/poc" 在原镜像上面加一层（不用 docker commit），所以原镜像的
 ENTRYPOINT、CMD、WORKDIR、ENV、USER 等配置原样保留。推送前核对三件事：/tmp/poc 确实没了、镜像配置没变、
@@ -23,6 +27,7 @@ ENTRYPOINT、CMD、WORKDIR、ENV、USER 等配置原样保留。推送前核对�
 旧版本清理掉）。fix_agent_images.py 也用这个文件里的函数，两个文件要放在同一个目录。
 """
 import argparse
+import datetime
 import json
 import os
 import re
@@ -30,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 # 平台文档 6.4 里写进 /etc/hosts 的 SWR IP，已经失效；只用来认出过期的 hosts 条目
 OLD_SWR_IP = "7.244.3.183"
@@ -130,16 +136,17 @@ def probe(image):
     return poc, [line for line in lines if line.strip()]
 
 
-def build_patched(image, user, remove_poc, remove_vcs, tag):
-    """在原镜像上加一层删文件，打成本地临时 tag；只改文件，不动配置。"""
+def build_patched(image, user, remove_poc, remove_vcs, tag, token):
+    """在原镜像上加一层删文件，打成本地临时 tag；只改文件，不动配置。
+    RUN 行末尾的 "# <token>" 是 shell 注释，不影响结果，只用来在构建缓存里认出这次构建留下的记录。"""
     lines = [f"FROM {image}"]
     switch_user = user not in ("", "root", "0", "0:0")
     if switch_user:
         lines.append("USER 0")  # 用数字：镜像里没有 /etc/passwd 时 "root" 解析不了
     if remove_poc:
-        lines.append('RUN ["rm", "-f", "/tmp/poc"]')
+        lines.append(f"RUN rm -f /tmp/poc  # {token}")
     if remove_vcs:
-        lines.append("RUN find /src \\( -name .git -o -name .hg \\) -prune -exec rm -rf {} +")
+        lines.append(f"RUN find /src \\( -name .git -o -name .hg \\) -prune -exec rm -rf {{}} +  # {token}")
     if switch_user:
         lines.append(f"USER {user}")
     with tempfile.TemporaryDirectory() as ctx:
@@ -153,6 +160,59 @@ def build_patched(image, user, remove_poc, remove_vcs, tag):
     if r.returncode != 0:
         raise Failed(f"构建失败：{(r.stdout + r.stderr).strip()[-1500:]}")
     return len([x for x in lines if x.startswith("RUN")])
+
+
+def created_at(record):
+    """构建缓存记录的创建时间（epoch 秒），格式如 2026-10-29 23:29:12.86 +0000 UTC。"""
+    m = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:\.\d+)? ([+-]\d{4})", record.get("CreatedAt") or "")
+    return datetime.datetime.strptime(f"{m[1]} {m[2]}", "%Y-%m-%d %H:%M:%S %z").timestamp() if m else 0
+
+
+def prune_build_cache(token, since):
+    """删掉这次构建在 BuildKit 构建缓存里留下的记录，包括 FROM 引进来的原镜像各层（不删的话，镜像删了磁盘也不会释放）。
+    只删这次构建建的：带 token 的两步 RUN、它们往上的父记录、挂在这些记录上的子记录，而且创建时间不早于这次构建开始。
+    别人的构建缓存不动；被别的镜像用着的层，镜像本身还在，删缓存记录不影响它。返回删掉的记录数。"""
+    r = docker("buildx", "du", "--format", "json")
+    if r.returncode != 0:
+        return 0  # 没有 buildx 时用的是老构建器，不留构建缓存
+    records = {}
+    for line in r.stdout.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        records[rec["ID"]] = rec
+    ours = lambda rec: created_at(rec) >= since - 2  # noqa: E731
+    mine = {i for i, rec in records.items() if token in (rec.get("Description") or "")}
+    stack = list(mine)
+    while stack:  # 往上：FROM 引进来的原镜像各层
+        for p in records[stack.pop()].get("Parents") or []:
+            if p in records and p not in mine and ours(records[p]):
+                mine.add(p)
+                stack.append(p)
+    grew = bool(mine)
+    while grew:  # 往下：这次构建挂在这些层上的其他记录（导出镜像时留下的）
+        grew = False
+        for i, rec in records.items():
+            if i not in mine and ours(rec) and set(rec.get("Parents") or []) & mine:
+                mine.add(i)
+                grew = True
+    left = set(mine)
+    while left:  # 先删子记录，再删父记录
+        leaves = [i for i in left if not any(i in (records[j].get("Parents") or []) for j in left)]
+        if not leaves:
+            break
+        for i in leaves:
+            docker("builder", "prune", "-f", "--filter", f"id={i}")
+            left.discard(i)
+    return len(mine)
+
+
+def free_space():
+    """存镜像的盘还剩多少（docker 和 containerd 的目录取较小的）。"""
+    root = docker("info", "--format", "{{.DockerRootDir}}").stdout.strip()
+    sizes = [os.statvfs(d).f_bavail * os.statvfs(d).f_frsize for d in (root, "/var/lib/containerd") if d and os.path.isdir(d)]
+    return human(min(sizes)) if sizes else "?"
 
 
 def process(image, args, target=None):
@@ -176,6 +236,8 @@ def process(image, args, target=None):
     print(f"拉取完成：{human(old.get('Size'))}，用时 {time.monotonic() - start:.0f}s，digest {old_digest or '（未知）'}")
 
     tmp = f"remove-poc-tmp:{os.getpid()}"
+    token = f"remove-poc-{uuid.uuid4().hex[:12]}"
+    build_start = None
     result = {"image": image, "target": target, "status": "", "old_digest": old_digest, "new_digest": ""}
     pushed = False
     try:
@@ -190,7 +252,8 @@ def process(image, args, target=None):
             return result
 
         print("在原镜像上加一层删除，构建并核对中…", flush=True)
-        steps = build_patched(image, (old.get("Config") or {}).get("User") or "", remove_poc, remove_vcs, tmp)
+        build_start = time.time()
+        steps = build_patched(image, (old.get("Config") or {}).get("User") or "", remove_poc, remove_vcs, tmp, token)
         new = inspect(tmp)
         poc_after, vcs_after = probe(tmp)
         problems = []
@@ -240,6 +303,7 @@ def process(image, args, target=None):
         result["status"] = "pushed"
         return result
     finally:
+        # 每处理完一个就清掉本次留下的东西；本机原来就有的镜像和别人的构建缓存不动
         if not args.keep:
             docker("image", "rm", tmp)
             if target != image:
@@ -247,6 +311,9 @@ def process(image, args, target=None):
             if not had_local:
                 docker("image", "rm", image)    # 本次拉下来的（推回原地址后它已经指向新镜像）
                 docker("image", "rm", old["Id"])  # 原镜像（推回原地址后已经没有 tag 了）
+            if build_start is not None:
+                prune_build_cache(token, build_start)
+            print(f"本地已清理，磁盘剩余 {free_space()}")
         if pushed and had_local and target == image:
             print(f"注意：本地原来就有 {image}，现在它指向新镜像；原镜像 {old['Id'][:19]} 没有删")
 

@@ -15,7 +15,10 @@ agent 镜像 = task.toml 里 [environment] 的 docker_image（push.sh 回填的�
     python3 fix_agent_images.py <文件夹> --push --overwrite 推回原地址覆盖，task.toml 不变
 其他参数：
     --only list_cheating.txt   只处理列表里的 bundle（每行一个 bundle 名）；列表里有、文件夹里没有的会报出来
-    --keep                     结束后不删本地镜像
+    --keep                     结束后不删本地镜像和构建缓存
+
+本地磁盘：每处理完一个 bundle 就删掉这次拉下来的镜像、打的 tag 和这次构建留下的构建缓存，打印磁盘剩余；
+机器上别人的镜像和构建缓存不动（细节见 remove_poc_swr.py 开头）。
 
 推荐用新 tag：已经拉过旧 tag 的机器不会继续用缓存里没修的旧镜像；旧镜像也还在，出问题能回退。
 可以断点续跑：docker_image 已经是 -hardened 的 bundle 会跳过；--overwrite 时已经修过的镜像会显示"不需要处理"。
