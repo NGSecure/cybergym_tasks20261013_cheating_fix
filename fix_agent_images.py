@@ -16,13 +16,18 @@ agent 镜像 = task.toml 里 [environment] 的 docker_image（push.sh 回填的�
     --new-tag     改成推到新 tag（原 tag 后面加 -hardened），并把 task.toml 的 docker_image 改成新地址；原地址不动。
                   覆盖同一个 tag 时，平台节点如果按 tag 缓存镜像（IfNotPresent），已经拉过旧镜像的节点可能还在用旧的；
                   担心这一点就用 --new-tag（地址变了，节点一定会重新拉）
-    --recheck     不看日志，每个都重新拉下来检查
+    --recheck     不看日志，每个都重新拉下来检查（-hardened 地址也查）
     --keep        结束后不删本地镜像和构建缓存
 
 重跑、中断：
 - 每个镜像推完（或检查发现本来就干净）都记进当前目录的 remove_poc_swr.log。在同一个目录重跑同一条命令，
   日志里记着做完的直接跳过，不再拉镜像；所以中途断了，重跑会从没做完的那个接着做。
-- 已经修过的镜像就算再处理一遍也不会出错：拉下来发现没有 /tmp/poc 和 .git/.hg，显示"不需要处理"，不推送。
+- 日志只用来跳过；日志里没有的（比如队友已经修过的）照常拉下来看镜像里实际还有什么，只补上还缺的：
+  /tmp/poc 和 .git/.hg 都没了就显示"不需要处理"、不推送；只删过 /tmp/poc 的，只补删 .git/.hg。
+- 推送前会再核对一次 SWR：处理期间有人往同一个 tag 推了新镜像，就不推（不能用旧镜像改出来的版本把它盖掉），
+  报失败，重跑时按新的镜像重新检查。
+- 日志记着做完、之后又被别人推回没修的镜像的，普通重跑会跳过；全部跑完、队友也都推完以后，可以加 --recheck
+  再核对一遍（修好的只拉下来检查，不会重复推）。
 - 中断（Ctrl+C、kill、断开 SSH）时先清掉当前这个镜像在本机留下的东西再退出；kill -9 或死机留下的，下次启动时
   自动清掉。SWR 上的 tag 要等推送最后一步才切换，推到一半断了的，SWR 上还是原来的镜像。详见 remove_poc_swr.py 开头。
 - 一千多个要跑很久，建议在 tmux/screen 里或者用 nohup 跑，断开 SSH 也不会停。
@@ -37,6 +42,7 @@ import os
 import re
 import shutil
 import sys
+import traceback
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -179,7 +185,7 @@ def main():
             if problem:
                 n["有问题"] += 1
                 print(f"[有问题] {name}：{problem}")
-            elif image.endswith(SUFFIX) or done_before(log, image, target):
+            elif (image.endswith(SUFFIX) and not args.recheck) or done_before(log, image, target):
                 n["已做完"] += 1
                 entry = done_before(log, image, target)
                 late = entry and entry["status"] == "pushed" and target != image  # 推完、改 task.toml 之前断了的
@@ -210,7 +216,7 @@ def main():
             print(f"跳过：{problem}")
             failed.append(name)
             continue
-        if image.endswith(SUFFIX):
+        if image.endswith(SUFFIX) and not args.recheck:
             print(f"已经是修复后的镜像（{SUFFIX}），跳过：{image}")
             n["已做完"] += 1
             continue
@@ -242,9 +248,14 @@ def main():
             print(f"失败：{exc}")
             failed.append(name)
             continue
+        except Exception:  # noqa: BLE001  意外错误也只算这一个失败，接着做下一个
+            print(f"失败（意外错误）：\n{traceback.format_exc()}")
+            failed.append(name)
+            continue
         n[{"pushed": "已推送", "dry-run": "dry-run 通过", "clean": "不需要处理"}[res["status"]]] += 1
 
-    print("\n共 {} 个：{}".format(len(rows), "，".join(f"{k} {v}" for k, v in n.items()) or "无"))
+    parts = [f"{k} {v}" for k, v in n.items()] + ([f"失败或跳过 {len(failed)}"] if failed else [])
+    print(f"\n共 {len(rows)} 个：{'，'.join(parts)}")
     if failed:
         print(f"失败或跳过 {len(failed)} 个（修好原因后重跑同一条命令即可）：\n  " + "\n  ".join(failed))
     return 1 if failed else 0

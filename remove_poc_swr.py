@@ -16,6 +16,9 @@
 构建缓存里留下的记录（原镜像各层也在里面，不删的话磁盘不会释放），然后打印磁盘剩余。机器上别人的镜像、
 运行前本地就有的镜像、别人的构建缓存都不动；只留下每次几 KB 的构建上下文记录（分不清是谁的，不删）。
 
+镜像里已经没有的就不再删（比如别人修过的：两样都没了就不推送）；推送前再拉一次清单，确认处理期间 SWR 上
+这个 tag 没被别人推过新镜像，否则不推。
+
 怎么删：用 "FROM <原镜像>" + "RUN rm -f /tmp/poc" 在原镜像上面加一层（不用 docker commit），所以原镜像的
 ENTRYPOINT、CMD、WORKDIR、ENV、USER 等配置原样保留。推送前核对三件事：/tmp/poc 确实没了、镜像配置没变、
 只是在原来的层上面多了一层。新加的这一层把文件标记为删除，容器里看不到也读不到；原来那一层的数据还在镜像里，
@@ -45,6 +48,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 
 # 平台文档 6.4 里写进 /etc/hosts 的 SWR IP，已经失效；只用来认出过期的 hosts 条目
@@ -52,9 +56,11 @@ OLD_SWR_IP = "7.244.3.183"
 LOG = "remove_poc_swr.log"
 # 每个运行中的进程在这里记下当前这个镜像拉了什么、打了什么 tag、构建用的标记；被强行杀掉时，下次启动按它清理
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "remove_poc_swr")
-# 在镜像里跑：/tmp/poc 在不在（大小、sha256），/src 下还有几个 .git/.hg
+# 在镜像里跑：/tmp/poc 在不在（大小、sha256；不是普通文件时报类型），/src 下还有几个 .git/.hg
 PROBE = (
-    'if [ -e /tmp/poc ]; then echo "poc $(stat -c %s /tmp/poc)"; sha256sum /tmp/poc; else echo "poc -"; fi; '
+    'if [ -f /tmp/poc ] && [ ! -L /tmp/poc ]; then echo "poc $(stat -c %s /tmp/poc) $(sha256sum /tmp/poc 2>/dev/null)"; '
+    'elif [ -e /tmp/poc ] || [ -L /tmp/poc ]; then echo "poc-other $(stat -c %F /tmp/poc 2>/dev/null)"; '
+    'else echo "poc -"; fi; '
     "find /src \\( -name .git -o -name .hg \\) -prune 2>/dev/null"
 )
 # 这些配置项删文件前后必须一样
@@ -165,13 +171,13 @@ def probe(image):
     if r.returncode != 0:
         raise Failed(f"在镜像里检查 /tmp/poc 失败：{r.stderr.strip()}")
     lines = r.stdout.splitlines()
-    poc = None
-    if lines and lines[0].startswith("poc ") and lines[0] != "poc -":
-        poc = (int(lines[0].split()[1]), lines[1].split()[0])
-        lines = lines[2:]
-    else:
-        lines = lines[1:]
-    return poc, [line for line in lines if line.strip()]
+    head = lines[0].split() if lines else []
+    if head[:1] == ["poc-other"]:
+        raise Failed(f"/tmp/poc 不是普通文件（{' '.join(head[1:]) or '类型未知'}），没有处理，请手工检查这个镜像")
+    if head[:1] != ["poc"] or len(head) < 2 or not (head[1] == "-" or head[1].isdigit()):
+        raise Failed(f"看不懂镜像里的检查结果：{r.stdout[:300]!r}")
+    poc = None if head[1] == "-" else (int(head[1]), head[2] if len(head) > 2 else "?")
+    return poc, [line for line in lines[1:] if line.strip()]
 
 
 def build_patched(image, user, remove_poc, remove_vcs, tag, token):
@@ -425,7 +431,7 @@ def process(image, args, target=None):
     tmp = f"remove-poc-tmp:{os.getpid()}"
     token = f"remove-poc-{uuid.uuid4().hex[:12]}"
     state = {"image": image, "images": [], "token": "", "since": 0}
-    old, build_start, pushed, pulling = None, None, False, False
+    old, build_start, pushed, pulling, retagged = None, None, False, False, False
 
     def remember(images=(), **items):  # 先记下来再动手，被强行杀掉时下次启动能清理（--keep 时不记）
         if not args.keep:
@@ -482,8 +488,8 @@ def process(image, args, target=None):
             problems.append(f"层数不对：原来 {len(old_layers)} 层，新的 {len(new_layers)} 层（应该多 {steps} 层）")
         if problems:
             raise Failed("核对没通过，不推送：" + "；".join(problems))
-        print(f"核对通过：/tmp/poc 已删除{'，.git/.hg 已删除' if remove_vcs else ''}；配置没变；"
-              f"原来 {len(old_layers)} 层上面多了 {steps} 层；新镜像 {new['Id']}")
+        done = ["/tmp/poc 已删除" if remove_poc else "/tmp/poc 本来就没有"] + (["，.git/.hg 已删除"] if remove_vcs else [])
+        print(f"核对通过：{''.join(done)}；配置没变；原来 {len(old_layers)} 层上面多了 {steps} 层；新镜像 {new['Id']}")
 
         if not args.push:
             where = f"，覆盖现在的 {old_digest or '版本'}" if target == image else "（原地址不动）"
@@ -491,9 +497,17 @@ def process(image, args, target=None):
             result["status"] = "dry-run"
             return result
 
+        # 推送前再拉一次（层都在本地，只核对清单）：处理期间别人往这个 tag 推了新镜像的话，不能用旧镜像改出来的版本把它盖掉
+        r = docker("pull", image, timeout=600)
+        if r.returncode != 0:
+            raise Failed(f"推送前核对 SWR 失败，没有推送：{r.stderr.strip()}\n→ {explain(host, r.stderr)}")
+        if inspect(image)["Id"] != old["Id"]:
+            raise Failed("处理期间 SWR 上这个 tag 被别人推了新镜像，没有推送（不能用旧镜像改出来的版本把它盖掉）；"
+                         "重跑会按新的镜像重新检查")
         if target != image:
             remember([target])
         docker("tag", tmp, target)  # 推回原地址时，本地这个 tag 先指向新镜像，推送失败再改回原镜像
+        retagged = target == image
         print("推送中…", flush=True)
         start = time.monotonic()
         r = docker("push", target, timeout=7200)
@@ -538,11 +552,10 @@ def process(image, args, target=None):
                 note = pull_kept_note() if pulling and sys.exc_info()[0] is KeyboardInterrupt else ""
                 if note:
                     say(note)
-            if had_local and target == image and old:
-                if pushed:
-                    say(f"注意：本地原来就有 {image}，现在它指向新镜像；原镜像 {old['Id'][:19]} 没有删")
-                else:
-                    docker("tag", old["Id"], image)  # 推送前被中断：本地这个 tag 指回原镜像
+            if had_local and pushed and target == image:
+                say(f"注意：本地原来就有 {image}，现在它指向新镜像；原镜像 {old['Id'][:19]} 没有删")
+            elif had_local and retagged:
+                docker("tag", old["Id"], image)  # 没推成：本地这个 tag 指回原镜像
 
 
 def main():
@@ -577,6 +590,9 @@ def main():
             process(image, args)
         except Failed as exc:
             print(f"失败：{exc}")
+            failed.append(image)
+        except Exception:  # noqa: BLE001  意外错误也只算这一个失败，接着做下一个
+            print(f"失败（意外错误）：\n{traceback.format_exc()}")
             failed.append(image)
     if len(images) > 1:
         print(f"\n共 {len(images)} 个，失败 {len(failed)} 个" + ("：\n  " + "\n  ".join(failed) if failed else ""))
