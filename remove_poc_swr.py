@@ -22,15 +22,25 @@ ENTRYPOINT、CMD、WORKDIR、ENV、USER 等配置原样保留。推送前核对�
 效果和 Dockerfile 里加 RUN rm -f /tmp/poc 一样。
 
 和 push_swr.py 一样直接用本机 docker：事先 docker login 过 SWR 就行，不经过平台，也不需要 cwm SDK。
-每次真正推送都会在当前目录的 remove_poc_swr.log 里记一行：时间、原地址、推到的地址、原 digest、新 digest、
-删掉的 /tmp/poc 的大小和 sha256。原 digest 用来回退（docker pull <仓库>@<原 digest>，前提是 SWR 还没把没有 tag 的
-旧版本清理掉）。fix_agent_images.py 也用这个文件里的函数，两个文件要放在同一个目录。
+每推一个（加 --vcs 时，检查发现本来就干净的也算）都在当前目录的 remove_poc_swr.log 里记一行：时间、状态、原地址、
+推到的地址、原 digest、新 digest、删掉的 /tmp/poc 的大小和 sha256、删掉的 .git/.hg 个数。原 digest 用来回退
+（docker pull <仓库>@<原 digest>，前提是 SWR 还没把没有 tag 的旧版本清理掉）。
+
+中断：Ctrl+C、kill、断开 SSH 都会先把当前这个镜像在本机留下的东西清掉再退出（正在镜像里做几秒钟的检查时，等它做完）；
+kill -9 或死机来不及清理的，下次启动时自动清掉（只清已经结束的进程留下的，别人正在跑的不动）。拉取被打断时，
+docker（containerd 镜像存储）会把已经下载的部分保留最多 8 小时，重跑时接着用，到时间自动释放。
+SWR 上的 tag 要等推送最后一步才切换，推到一半中断的，SWR 上还是原来的镜像，重跑会重做。
+fix_agent_images.py 也用这个文件里的函数，两个文件要放在同一个目录。
 """
 import argparse
+import contextlib
+import ctypes
 import datetime
+import glob
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -40,6 +50,8 @@ import uuid
 # 平台文档 6.4 里写进 /etc/hosts 的 SWR IP，已经失效；只用来认出过期的 hosts 条目
 OLD_SWR_IP = "7.244.3.183"
 LOG = "remove_poc_swr.log"
+# 每个运行中的进程在这里记下当前这个镜像拉了什么、打了什么 tag、构建用的标记；被强行杀掉时，下次启动按它清理
+STATE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "remove_poc_swr")
 # 在镜像里跑：/tmp/poc 在不在（大小、sha256），/src 下还有几个 .git/.hg
 PROBE = (
     'if [ -e /tmp/poc ]; then echo "poc $(stat -c %s /tmp/poc)"; sha256sum /tmp/poc; else echo "poc -"; fi; '
@@ -54,8 +66,25 @@ class Failed(Exception):
     pass
 
 
+try:
+    _prctl = getattr(ctypes.CDLL(None), "prctl", None)  # 只有 Linux 有
+except OSError:
+    _prctl = None
+
+
+def die_with_parent():
+    """在 docker 子进程里、exec 之前执行：本脚本被 kill -9 时子进程也收到 SIGKILL，dockerd 随之取消拉取/推送/构建。"""
+    if _prctl is not None:
+        _prctl(1, int(signal.SIGKILL))  # PR_SET_PDEATHSIG
+
+
 def docker(*args, timeout=None):
-    return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+    # 子进程单独一个会话：终端的 Ctrl+C、断线信号只发给本脚本，由本脚本结束子进程并清理
+    try:
+        return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL, start_new_session=True, preexec_fn=die_with_parent)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"timeout：docker {args[0]} 超过 {timeout}s 没有结束")
 
 
 def human(n):
@@ -97,6 +126,8 @@ def hosts_note(host, message):
 
 def explain(host, message):
     s = message.lower()
+    if "没有结束" in message:  # docker() 的超时
+        return "超时：网络太慢或者卡住了；重跑同一条命令会重新做这一个"
     if "docker daemon" in s or "docker.sock" in s:
         return "连不上 dockerd：确认 docker 在运行，当前用户在 docker 组里（或用 sudo 跑）"
     if "unauthorized" in s or "authentication required" in s or "denied" in s or "repository does not exist" in s:
@@ -120,10 +151,17 @@ def inspect(image):
     return json.loads(r.stdout)[0]
 
 
+def probe_name(pid):
+    """检查用的临时容器名；中断时容器可能还在跑，清理时按名字删掉，否则镜像删不掉。"""
+    return f"remove-poc-probe-{pid}"
+
+
 def probe(image):
-    """返回 (/tmp/poc 的大小和 sha256，没有时为 None；/src 下 .git/.hg 的路径列表)。"""
-    r = docker("run", "--rm", "--network", "none", "--user", "0:0", "--entrypoint", "/bin/sh", image, "-c", PROBE,
-               timeout=600)
+    """返回 (/tmp/poc 的大小和 sha256，没有时为 None；/src 下 .git/.hg 的路径列表)。
+    检查只要几秒，中途收到 Ctrl+C/kill 等它做完再中断：docker run 被打断时容器可能刚建好还没启动，--rm 管不到它。"""
+    with deferred_interrupt("收到中断，等这一步检查做完（通常几秒）再清理退出…"):
+        r = docker("run", "--rm", "--name", probe_name(os.getpid()), "--network", "none", "--user", "0:0",
+                   "--entrypoint", "/bin/sh", image, "-c", PROBE, timeout=600)
     if r.returncode != 0:
         raise Failed(f"在镜像里检查 /tmp/poc 失败：{r.stderr.strip()}")
     lines = r.stdout.splitlines()
@@ -208,11 +246,169 @@ def prune_build_cache(token, since):
     return len(mine)
 
 
+def anchor_build_cache(image, token, tag):
+    """构建在导入原镜像各层时就被中断（或者构建失败）的话，原镜像各层的缓存记录上没有标记，prune_build_cache 找不到它们。
+    这时用同一个原镜像再做一次只写构建缓存、不生成镜像的构建（各层直接复用，不到一秒），加一步带标记的 RUN 连到这些记录上。
+    要在删掉原镜像之前调用；已经有带标记的记录时什么都不做。"""
+    r = docker("buildx", "du", "--format", "json")
+    if r.returncode != 0 or token in r.stdout or docker("image", "inspect", image).returncode != 0:
+        return
+    with tempfile.TemporaryDirectory() as ctx:
+        with open(os.path.join(ctx, "Dockerfile"), "w") as f:
+            f.write(f"FROM {image}\nUSER 0\nRUN true  # {token}\n")
+        base = ["build", "-q", "--pull=false", "--network", "none"]
+        r = docker(*base, "-o", "type=cacheonly", ctx, timeout=600)
+        if r.returncode != 0 and "cacheonly" in r.stderr:  # 老版本不支持只写缓存：打成临时 tag，调用方随后会删掉
+            docker(*base, "-t", tag, ctx, timeout=600)
+
+
+def pull_kept_note():
+    """拉取被打断（Ctrl+C、kill、超时）时 dockerd 会保留已经下载的部分，返回给用户的说明；不会保留时返回空串。
+    只有 containerd 镜像存储会这样（dockerd 给这次拉取的 lease 留 8 小时，方便续传）；释放它的 docker image prune
+    会连带别人正在进行的拉取一起弄失败，所以这里不去动它。"""
+    info = docker("info", "--format", "{{json .DriverStatus}}").stdout
+    if "io.containerd.snapshotter" not in info:
+        return ""
+    return ("注意：拉取被打断时，docker 会把已经下载的部分保留最多 8 小时（重跑这个镜像时接着用，不用重新下载），"
+            "到时间自动释放，所以磁盘剩余暂时会少这么多")
+
+
 def free_space():
     """存镜像的盘还剩多少（docker 和 containerd 的目录取较小的）。"""
     root = docker("info", "--format", "{{.DockerRootDir}}").stdout.strip()
     sizes = [os.statvfs(d).f_bavail * os.statvfs(d).f_frsize for d in (root, "/var/lib/containerd") if d and os.path.isdir(d)]
     return human(min(sizes)) if sizes else "?"
+
+
+def write_log(status, image, target, old_digest, new_digest="", poc=None, vcs="-"):
+    """日志一行：时间、状态（pushed 已推送 / clean 本来就干净）、原地址、推到的地址、原 digest、新 digest、
+    删掉的 /tmp/poc 大小和 sha256、删掉的 .git/.hg 个数（vcs=- 表示没检查 .git/.hg，也就是没加 --vcs）。
+    重跑时 fix_agent_images.py 靠它跳过已经做完的。"""
+    with open(LOG, "a") as f:
+        f.write("\t".join([time.strftime("%Y-%m-%d %H:%M:%S"), status, image, target, old_digest, new_digest,
+                           str(poc[0]) if poc else "-", poc[1] if poc else "-", f"vcs={vcs}"]) + "\n")
+
+
+def read_log(path=LOG):
+    """读日志：{原地址: [{status, target, time, vcs_checked}, ...]}。"""
+    done = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                cols = line.rstrip("\n").split("\t")
+                if len(cols) >= 9 and cols[1] in ("pushed", "clean"):
+                    done.setdefault(cols[2], []).append(
+                        {"status": cols[1], "target": cols[3], "time": cols[0], "vcs_checked": cols[8] != "vcs=-"})
+    except OSError:
+        pass
+    return done
+
+
+def proc_start(pid):
+    """进程的启动时间（/proc/<pid>/stat 第 22 项），用来分辨 PID 是不是已经被别的进程重用；读不到时返回 None。"""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def alive(pid, start):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return start is None or proc_start(pid) in (None, start)
+
+
+def save_state(**items):
+    """记下当前这个镜像在本机留下了什么（被强行杀掉时下次启动用它清理）。先写临时文件再改名，不会读到写了一半的。"""
+    path = os.path.join(STATE_DIR, f"{os.getpid()}.json")
+    with contextlib.suppress(OSError):  # 写不了也不影响处理，只是被 kill -9 时下次启动没法替它清理
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump(dict(items, start=proc_start(os.getpid())), f)
+        os.replace(path + ".tmp", path)
+
+
+def clear_state():
+    try:
+        os.remove(os.path.join(STATE_DIR, f"{os.getpid()}.json"))
+    except OSError:
+        pass
+
+
+def cleanup_stale():
+    """清理之前被强行杀掉的运行（kill -9、死机）留下的镜像和构建缓存；还在跑的进程留下的不动。"""
+    removed = 0
+    for path in glob.glob(os.path.join(STATE_DIR, "*.json")):
+        try:
+            pid = int(os.path.basename(path)[:-len(".json")])
+            with open(path) as f:
+                items = json.load(f)
+        except (ValueError, OSError):
+            continue
+        if pid != os.getpid() and alive(pid, items.get("start")):
+            continue  # 进程还在跑（可能是别人在用），不动
+        docker("rm", "-f", probe_name(pid))
+        if items.get("token") and items.get("image"):
+            anchor_build_cache(items["image"], items["token"], f"remove-poc-tmp:{pid}")
+        for ref in items.get("images", []):
+            removed += docker("image", "rm", ref).returncode == 0
+        if items.get("token"):
+            removed += prune_build_cache(items["token"], items.get("since", 0))
+        with contextlib.suppress(OSError):
+            os.remove(path)
+    if removed:
+        print(f"清理了之前中断的运行留下的 {removed} 个镜像 tag 和构建缓存记录，磁盘剩余 {free_space()}")
+
+
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def install_signal_handlers():
+    """kill（SIGTERM）、断开 SSH（SIGHUP）和 Ctrl+C 一样处理：先把当前这个镜像的东西清掉再退出。
+    用 nohup 运行时 SIGHUP 是忽略的，保持忽略（断开 SSH 不影响）。"""
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) is not signal.SIG_IGN:
+            signal.signal(sig, stop)
+
+
+@contextlib.contextmanager
+def deferred_interrupt(notice=None):
+    """这段代码执行期间收到 Ctrl+C/kill 先记下，执行完再中断，免得清理、写文件做到一半。"""
+    got = []
+
+    def defer(signum, frame):
+        if notice and not got:
+            try:
+                print(f"\n{notice}", flush=True)
+            except Exception:  # noqa: BLE001  终端断开，或者正好打断了另一次输出
+                pass
+        got.append(signum)
+
+    old = {s: signal.getsignal(s) for s in STOP_SIGNALS}
+    old = {s: h for s, h in old.items() if h not in (signal.SIG_IGN, None)}
+    for s in old:
+        signal.signal(s, defer)
+    try:
+        yield
+    finally:
+        for s, handler in old.items():
+            signal.signal(s, handler)
+        if got:
+            raise KeyboardInterrupt
+
+
+def say(message):
+    try:
+        print(message, flush=True)
+    except OSError:
+        pass  # 终端已经断开（比如 SSH 掉线）
 
 
 def process(image, args, target=None):
@@ -226,21 +422,35 @@ def process(image, args, target=None):
     print(f"\n=== {image}" + ("" if target == image else f"\n    → {target}"))
 
     had_local = docker("image", "inspect", image).returncode == 0
-    print("拉取中…", flush=True)
-    start = time.monotonic()
-    r = docker("pull", image, timeout=7200)
-    if r.returncode != 0:
-        raise Failed(f"拉取失败：{r.stderr.strip()}\n→ {explain(host, r.stderr)}")
-    old = inspect(image)
-    old_digest = next((d.split("@", 1)[1] for d in old.get("RepoDigests") or [] if d.startswith(repo + "@")), "")
-    print(f"拉取完成：{human(old.get('Size'))}，用时 {time.monotonic() - start:.0f}s，digest {old_digest or '（未知）'}")
-
     tmp = f"remove-poc-tmp:{os.getpid()}"
     token = f"remove-poc-{uuid.uuid4().hex[:12]}"
-    build_start = None
-    result = {"image": image, "target": target, "status": "", "old_digest": old_digest, "new_digest": ""}
-    pushed = False
+    state = {"image": image, "images": [], "token": "", "since": 0}
+    old, build_start, pushed, pulling = None, None, False, False
+
+    def remember(images=(), **items):  # 先记下来再动手，被强行杀掉时下次启动能清理（--keep 时不记）
+        if not args.keep:
+            state["images"] += list(images)
+            state.update(items)
+            save_state(**state)
+
     try:
+        if not had_local:
+            remember([image])
+        print("拉取中…", flush=True)
+        start = time.monotonic()
+        pulling = True
+        r = docker("pull", image, timeout=7200)
+        pulling = False
+        if r.returncode != 0:
+            kept = pull_kept_note() if r.returncode == 124 else ""  # 超时是本脚本结束的拉取，和中断一样
+            raise Failed(f"拉取失败：{r.stderr.strip()}\n→ {explain(host, r.stderr)}" + (f"\n{kept}" if kept else ""))
+        old = inspect(image)
+        if not had_local:
+            remember([old["Id"]])
+        old_digest = next((d.split("@", 1)[1] for d in old.get("RepoDigests") or [] if d.startswith(repo + "@")), "")
+        print(f"拉取完成：{human(old.get('Size'))}，用时 {time.monotonic() - start:.0f}s，digest {old_digest or '（未知）'}")
+        result = {"image": image, "target": target, "status": "", "old_digest": old_digest, "new_digest": ""}
+
         poc, vcs = probe(image)
         print(f"/tmp/poc：{'没有' if poc is None else f'{poc[0]} 字节，sha256 {poc[1]}'}")
         if args.vcs:
@@ -248,11 +458,14 @@ def process(image, args, target=None):
         remove_poc, remove_vcs = poc is not None, args.vcs and bool(vcs)
         if not remove_poc and not remove_vcs:
             print("不需要处理：镜像里已经没有 /tmp/poc" + ("，也没有 .git/.hg" if args.vcs else ""))
+            if args.vcs:  # 两样都查过了才算干净，记进日志，重跑时直接跳过
+                write_log("clean", image, image, old_digest, vcs=0)
             result["status"] = "clean"
             return result
 
         print("在原镜像上加一层删除，构建并核对中…", flush=True)
         build_start = time.time()
+        remember([tmp], token=token, since=build_start)
         steps = build_patched(image, (old.get("Config") or {}).get("User") or "", remove_poc, remove_vcs, tmp, token)
         new = inspect(tmp)
         poc_after, vcs_after = probe(tmp)
@@ -278,6 +491,8 @@ def process(image, args, target=None):
             result["status"] = "dry-run"
             return result
 
+        if target != image:
+            remember([target])
         docker("tag", tmp, target)  # 推回原地址时，本地这个 tag 先指向新镜像，推送失败再改回原镜像
         print("推送中…", flush=True)
         start = time.monotonic()
@@ -296,26 +511,38 @@ def process(image, args, target=None):
             raise Failed(f"推送后从 SWR 拉回来的不是新镜像（{served or check.stderr.strip()}），请手工检查")
         print(f"已推送{'并覆盖' if target == image else ''}，用时 {time.monotonic() - start:.0f}s："
               f"{old_digest or '?'} → {result['new_digest'] or '?'}")
-        with open(LOG, "a") as f:
-            f.write("\t".join([time.strftime("%Y-%m-%d %H:%M:%S"), image, target, old_digest, result["new_digest"],
-                               str(poc[0]) if poc else "-", poc[1] if poc else "-",
-                               f"vcs={len(vcs)}" if remove_vcs else "vcs=-"]) + "\n")
+        write_log("pushed", image, target, old_digest, result["new_digest"], poc, len(vcs) if args.vcs else "-")
         result["status"] = "pushed"
         return result
     finally:
-        # 每处理完一个就清掉本次留下的东西；本机原来就有的镜像和别人的构建缓存不动
-        if not args.keep:
-            docker("image", "rm", tmp)
-            if target != image:
-                docker("image", "rm", target)
-            if not had_local:
-                docker("image", "rm", image)    # 本次拉下来的（推回原地址后它已经指向新镜像）
-                docker("image", "rm", old["Id"])  # 原镜像（推回原地址后已经没有 tag 了）
-            if build_start is not None:
-                prune_build_cache(token, build_start)
-            print(f"本地已清理，磁盘剩余 {free_space()}")
-        if pushed and had_local and target == image:
-            print(f"注意：本地原来就有 {image}，现在它指向新镜像；原镜像 {old['Id'][:19]} 没有删")
+        # 每处理完一个就清掉本次留下的东西；本机原来就有的镜像和别人的构建缓存不动。
+        # 清理期间收到 Ctrl+C/kill 先记下，清完再退出
+        with deferred_interrupt():
+            if not args.keep:
+                if sys.exc_info()[0] is KeyboardInterrupt:
+                    say("\n中断，正在清理本机留下的东西…")
+                docker("rm", "-f", probe_name(os.getpid()))  # 中断时可能还在跑的检查容器
+                if build_start is not None:
+                    anchor_build_cache(image, token, tmp)  # 构建没做完时才需要；要在删原镜像之前
+                docker("image", "rm", tmp)
+                if target != image:
+                    docker("image", "rm", target)
+                if not had_local:
+                    docker("image", "rm", image)  # 本次拉下来的（推回原地址后它已经指向新镜像）
+                    if old:
+                        docker("image", "rm", old["Id"])  # 原镜像（推回原地址后已经没有 tag 了）
+                if build_start is not None:
+                    prune_build_cache(token, build_start)
+                clear_state()
+                say(f"本地已清理，磁盘剩余 {free_space()}")
+                note = pull_kept_note() if pulling and sys.exc_info()[0] is KeyboardInterrupt else ""
+                if note:
+                    say(note)
+            if had_local and target == image and old:
+                if pushed:
+                    say(f"注意：本地原来就有 {image}，现在它指向新镜像；原镜像 {old['Id'][:19]} 没有删")
+                else:
+                    docker("tag", old["Id"], image)  # 推送前被中断：本地这个 tag 指回原镜像
 
 
 def main():
@@ -337,6 +564,8 @@ def main():
         print("→ 连不上 dockerd：确认 docker 在运行，当前用户在 docker 组里（或用 sudo 跑）")
         return 1
     print(f"dockerd {server.stdout.strip()}；{'会推送（覆盖原 tag）' if args.push else 'dry-run，不推送'}")
+    install_signal_handlers()
+    cleanup_stale()
     for host in sorted({registry_host(i) for i in images}):
         note = login_note(host)
         if note:

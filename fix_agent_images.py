@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""给一个文件夹里每个 bundle 的 agent 镜像补上防作弊修复，推到 SWR，并让 task.toml 指向修好的镜像。
+"""给一个文件夹里每个 bundle 的 agent 镜像补上防作弊修复，再推回 SWR 原来的地址覆盖（task.toml 不用改）。
 做完以后这个文件夹可以直接打包上传，不用再 build、push。
 
 agent 镜像 = task.toml 里 [environment] 的 docker_image（push.sh 回填的第一个地址；task_server_image 不动）。
@@ -8,28 +8,34 @@ agent 镜像 = task.toml 里 [environment] 的 docker_image（push.sh 回填的�
     RUN find /src \\( -name .git -o -name .hg \\) -prune -exec rm -rf {} +
 
 用法（在文件夹外面运行：日志写在当前目录，不会混进要上传的文件夹）：
-    python3 fix_agent_images.py <文件夹> --plan             只读 task.toml，列出每个 bundle 的镜像和新地址，不拉镜像
-    python3 fix_agent_images.py <文件夹> --limit 3          dry-run：拉下来、修好、核对，不推送、不改 task.toml
-    python3 fix_agent_images.py <文件夹> --push             推到新 tag（原 tag 后面加 -hardened），再把 task.toml 的
-                                                         docker_image 改成新地址；原来的镜像不动
-    python3 fix_agent_images.py <文件夹> --push --overwrite 推回原地址覆盖，task.toml 不变
+    python3 fix_agent_images.py <文件夹> --only list_cheating.txt --plan       只读 task.toml，列出要做什么，不拉镜像
+    python3 fix_agent_images.py <文件夹> --only list_cheating.txt --limit 2    dry-run：拉下来、修好、核对，不推送
+    python3 fix_agent_images.py <文件夹> --only list_cheating.txt --push       推回原地址覆盖，task.toml 不变
 其他参数：
-    --only list_cheating.txt   只处理列表里的 bundle（每行一个 bundle 名）；列表里有、文件夹里没有的会报出来
-    --keep                     结束后不删本地镜像和构建缓存
+    --only LIST   只处理列表文件里的 bundle（每行一个名字）；列表里有、文件夹里没有的会报出来
+    --new-tag     改成推到新 tag（原 tag 后面加 -hardened），并把 task.toml 的 docker_image 改成新地址；原地址不动。
+                  覆盖同一个 tag 时，平台节点如果按 tag 缓存镜像（IfNotPresent），已经拉过旧镜像的节点可能还在用旧的；
+                  担心这一点就用 --new-tag（地址变了，节点一定会重新拉）
+    --recheck     不看日志，每个都重新拉下来检查
+    --keep        结束后不删本地镜像和构建缓存
+
+重跑、中断：
+- 每个镜像推完（或检查发现本来就干净）都记进当前目录的 remove_poc_swr.log。在同一个目录重跑同一条命令，
+  日志里记着做完的直接跳过，不再拉镜像；所以中途断了，重跑会从没做完的那个接着做。
+- 已经修过的镜像就算再处理一遍也不会出错：拉下来发现没有 /tmp/poc 和 .git/.hg，显示"不需要处理"，不推送。
+- 中断（Ctrl+C、kill、断开 SSH）时先清掉当前这个镜像在本机留下的东西再退出；kill -9 或死机留下的，下次启动时
+  自动清掉。SWR 上的 tag 要等推送最后一步才切换，推到一半断了的，SWR 上还是原来的镜像。详见 remove_poc_swr.py 开头。
+- 一千多个要跑很久，建议在 tmux/screen 里或者用 nohup 跑，断开 SSH 也不会停。
 
 本地磁盘：每处理完一个 bundle 就删掉这次拉下来的镜像、打的 tag 和这次构建留下的构建缓存，打印磁盘剩余；
-机器上别人的镜像和构建缓存不动（细节见 remove_poc_swr.py 开头）。
-
-推荐用新 tag：已经拉过旧 tag 的机器不会继续用缓存里没修的旧镜像；旧镜像也还在，出问题能回退。
-可以断点续跑：docker_image 已经是 -hardened 的 bundle 会跳过；--overwrite 时已经修过的镜像会显示"不需要处理"。
-每推一个，当前目录的 remove_poc_swr.log 里记一行：时间、原地址、新地址、原/新 digest、删掉的 /tmp/poc 大小和 sha256。
-需要 remove_poc_swr.py 放在同一个目录；事先 docker login 过 SWR（和 push_swr.py 同一个登录）。
+机器上别人的镜像和构建缓存不动。需要 remove_poc_swr.py 放在同一个目录；事先 docker login 过 SWR。
 """
 import argparse
 import collections
 import glob
 import os
 import re
+import shutil
 import sys
 import types
 
@@ -88,22 +94,43 @@ def set_agent_image(toml_path, old, new):
             done = True
     if not done:
         raise rp.Failed(f'task.toml 里没找到 docker_image = "{old}" 这一行，没有改')
-    with open(toml_path, "w", encoding="utf-8", newline="") as f:
-        f.write("".join(lines))
+    # 先写临时文件再替换：中断、磁盘满都不会把 task.toml 写坏
+    tmp = toml_path + ".tmp"
+    with rp.deferred_interrupt():
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                f.write("".join(lines))
+            shutil.copymode(toml_path, tmp)
+            os.replace(tmp, toml_path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+
+def done_before(log, image, target):
+    """日志里这个镜像是不是已经做完：本来就干净，或者已经推到了这次要推的地址（而且 .git/.hg 也处理过）。"""
+    for entry in log.get(image, []):
+        if entry["status"] == "clean" or (entry["target"] == target and entry["vcs_checked"]):
+            return entry
+    return None
 
 
 def main():
-    parser = argparse.ArgumentParser(description="修好文件夹里每个 bundle 的 agent 镜像并推送（默认 dry-run）")
+    parser = argparse.ArgumentParser(description="修好文件夹里每个 bundle 的 agent 镜像，推回原地址（默认 dry-run）")
     parser.add_argument("folder", help="放 bundle 的文件夹")
-    parser.add_argument("--push", action="store_true", help="核对通过后真的推送（并改 task.toml）")
-    parser.add_argument("--overwrite", action="store_true", help="推回原地址覆盖，task.toml 不变")
+    parser.add_argument("--push", action="store_true", help="核对通过后真的推送")
+    parser.add_argument("--overwrite", action="store_true", help="推回原地址覆盖，task.toml 不变（默认就是这样，可以不写）")
+    parser.add_argument("--new-tag", action="store_true", help=f"推到新 tag（原 tag + {SUFFIX}）并改 task.toml，原地址不动")
     parser.add_argument("--plan", action="store_true", help="只读 task.toml 列出要做什么，不拉镜像")
     parser.add_argument("--only", metavar="LIST", help="只处理列表文件里的 bundle（每行一个名字）")
     parser.add_argument("--limit", type=int, metavar="N", help="只处理前 N 个")
-    parser.add_argument("--keep", action="store_true", help="结束后不删本地镜像")
+    parser.add_argument("--recheck", action="store_true", help="不看日志，每个都重新拉下来检查")
+    parser.add_argument("--keep", action="store_true", help="结束后不删本地镜像和构建缓存")
     args = parser.parse_args()
     if args.plan and args.push:
         parser.error("--plan 和 --push 不能一起用")
+    if args.overwrite and args.new_tag:
+        parser.error("--overwrite 和 --new-tag 不能一起用")
     folder = os.path.abspath(args.folder)
     if not os.path.isdir(folder):
         parser.error(f"不是文件夹：{args.folder}")
@@ -133,7 +160,7 @@ def main():
         elif "task_server" in image or "task-server" in image:
             rows.append((name, b, image, "", f"docker_image 看起来是 task-server 镜像：{image}"))
         else:
-            target = image if args.overwrite or image.endswith(SUFFIX) else image + SUFFIX
+            target = image + SUFFIX if args.new_tag and not image.endswith(SUFFIX) else image
             rows.append((name, b, image, target, ""))
     junk = [f"{os.path.basename(b)}/{j}" for b in bundles for j in JUNK if os.path.exists(os.path.join(b, j))]
     if junk:
@@ -141,8 +168,10 @@ def main():
     if os.path.commonpath([os.getcwd(), folder]) == folder:
         print(f"注意：当前目录在 {folder} 里面，日志 {rp.LOG} 会混进要上传的文件夹，建议在外面运行")
 
-    mode = "推回原地址覆盖" if args.overwrite else f"推到新 tag（原 tag + {SUFFIX}）并改 task.toml"
-    print(f"{len(rows)} 个 bundle；{'只看计划' if args.plan else mode if args.push else 'dry-run，不推送、不改 task.toml'}")
+    log = {} if args.recheck else rp.read_log()
+    mode = f"推到新 tag（原 tag + {SUFFIX}）并改 task.toml" if args.new_tag else "推回原地址覆盖，task.toml 不变"
+    print(f"{len(rows)} 个 bundle；{'只看计划' if args.plan else mode if args.push else 'dry-run，不推送'}；"
+          f"日志 {os.path.abspath(rp.LOG)}（重跑时在同一个目录运行，做完的会跳过）")
 
     if args.plan:
         n = collections.Counter()
@@ -150,9 +179,11 @@ def main():
             if problem:
                 n["有问题"] += 1
                 print(f"[有问题] {name}：{problem}")
-            elif image.endswith(SUFFIX) and not args.overwrite:
-                n["已修好"] += 1
-                print(f"[已修好] {name}：{image}")
+            elif image.endswith(SUFFIX) or done_before(log, image, target):
+                n["已做完"] += 1
+                entry = done_before(log, image, target)
+                late = entry and entry["status"] == "pushed" and target != image  # 推完、改 task.toml 之前断了的
+                print(f"[已做完] {name}：{image}" + (f"\n          已推到 {target}，task.toml 还没改，加 --push 运行时补改" if late else ""))
             else:
                 n["待处理"] += 1
                 print(f"[待处理] {name}：{image}" + ("" if target == image else f"\n          → {target}"))
@@ -164,6 +195,8 @@ def main():
         print(server.stderr.strip())
         print("→ 连不上 dockerd：确认 docker 在运行，当前用户在 docker 组里（或用 sudo 跑）")
         return 1
+    rp.install_signal_handlers()
+    rp.cleanup_stale()
     for host in sorted({rp.registry_host(image) for _, _, image, _, _ in rows if image}):
         note = rp.login_note(host)
         if note:
@@ -177,13 +210,29 @@ def main():
             print(f"跳过：{problem}")
             failed.append(name)
             continue
-        if image.endswith(SUFFIX) and not args.overwrite:
-            print(f"已经是修复后的镜像，跳过：{image}")
-            n["已修好"] += 1
+        if image.endswith(SUFFIX):
+            print(f"已经是修复后的镜像（{SUFFIX}），跳过：{image}")
+            n["已做完"] += 1
             continue
+        entry = done_before(log, image, target)
         try:
-            res = results.get(image) or rp.process(image, opts, target)  # 几个 bundle 共用一个镜像时只处理一次
-            results[image] = res
+            if entry:
+                what = "本来就干净" if entry["status"] == "clean" else "已经修好并推送"
+                print(f"日志里记着 {entry['time']} {what}，跳过（要重新检查加 --recheck）")
+                if target != image and entry["status"] == "pushed":  # 推完、改 task.toml 之前断了的
+                    if args.push:
+                        set_agent_image(os.path.join(b, "task.toml"), image, target)
+                        print(f'task.toml 补改：docker_image = "{target}"')
+                    else:
+                        print(f'加 --push 后，task.toml 的 docker_image 会补改成 "{target}"')
+                n["已做完"] += 1
+                continue
+            if image in results:  # 几个 bundle 共用一个镜像时只处理一次
+                res, first = results[image]
+                print(f"和 {first} 用同一个镜像，上面已经处理过，结果相同")
+            else:
+                res = rp.process(image, opts, target)
+                results[image] = res, name
             if res["status"] == "pushed" and target != image:
                 set_agent_image(os.path.join(b, "task.toml"), image, target)
                 print(f'task.toml 已改：docker_image = "{target}"')
@@ -205,4 +254,4 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        sys.exit("\n已取消")
+        sys.exit("\n已中断：当前这个镜像在本机留下的东西已经清掉；在同一个目录重跑同一条命令会接着做")
